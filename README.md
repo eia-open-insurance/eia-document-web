@@ -21,6 +21,19 @@ Document federated remote: screens, widgets, record tabs, and transaction compos
 - Maintain README, CODEOWNERS, SECURITY, CHANGELOG, tests, and local verification.
 - Contain no business logic in shared libraries or front-end remotes.
 
+## Local run
+
+```powershell
+npm install
+npm start
+```
+
+- Port: `3008`.
+- Module Federation container `eia_document`, exposes `./App` from `remoteEntry.js`.
+- Dev server proxies `/api` to `http://localhost:8096`.
+- `npm run build` produces the production bundle in `dist/`.
+- `npm test` runs the Playwright test; the API is mocked in the test.
+
 ## Verification
 
 - Lint and format
