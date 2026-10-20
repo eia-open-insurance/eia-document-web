@@ -218,7 +218,7 @@ test('advances the document lifecycle and reaches a terminal state', async ({ pa
   expect(state.documents[0].version).toBe(6);
 });
 
-test('navigates every document tab and shows the unimplemented association state', async ({ page }) => {
+test('navigates every document tab and shows the evidence link empty state', async ({ page }) => {
   const state = await installDocumentMock(page);
 
   await page.goto('/');
@@ -240,8 +240,11 @@ test('navigates every document tab and shows the unimplemented association state
     await expect(panel.getByRole('heading', { name: heading, exact: true })).toBeVisible();
   }
 
-  await expect(page.locator('.eia-empty')).toContainText('No associations are recorded');
-  await expect(page.locator('.eia-empty')).toContainText('not exposed in this build');
+  await expect(page.getByTestId('associations-empty')).toContainText(
+    'No business records are linked'
+  );
+  await expect(page.getByTestId('associations-empty')).toContainText('This document is evidence');
+  await expect(page.getByRole('button', { name: 'Add link' })).toBeVisible();
   expect(state.requests.every((request) => !request.path.includes('/associations'))).toBe(true);
 });
 

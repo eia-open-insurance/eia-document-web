@@ -222,7 +222,7 @@ test('filters the document queue by number, title, type, and status', async ({ p
   expect(state.requests.every((request) => !request.path.endsWith('/search'))).toBe(true);
 });
 
-test('explains the evidence context and the missing association API without inventing links', async ({ page }) => {
+test('explains the evidence context and the empty related-record state', async ({ page }) => {
   const state = await installDocumentMock(page);
 
   await page.goto(`/?record=${DOCUMENT_A.id}`);
@@ -234,14 +234,13 @@ test('explains the evidence context and the missing association API without inve
 
   const related = page.getByTestId('related-records');
   await expect(related.getByRole('heading', { name: 'Related records' })).toBeVisible();
-  await expect(related).toContainText('Document associations are not yet exposed by this API');
   await expect(page.getByTestId('related-records-empty')).toBeVisible();
-  await expect(page.getByTestId('related-records-empty')).toContainText('No related records are available yet');
   await expect(page.getByTestId('related-records-empty')).toContainText(
-    'Document associations are not yet exposed by this API'
+    'No business records are linked yet'
   );
+  await expect(page.getByTestId('related-records-empty')).toContainText('Documents are evidence');
 
-  // No association endpoint exists, so the section must not fabricate links.
+  // With no links on the record, the section must not fabricate any.
   await expect(related.getByRole('link')).toHaveCount(0);
   expect(state.requests.every((request) => !request.path.includes('/associations'))).toBe(true);
   expect(state.requests.every((request) => !request.path.endsWith('/search'))).toBe(true);

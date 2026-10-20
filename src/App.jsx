@@ -1,9 +1,25 @@
 import React, { useEffect, useRef, useState } from 'react';
 import './ui.css';
+import { api } from './api.js';
+import EntityPicker from './EntityPicker.jsx';
+import {
+  LINK_REFERENCE_MAX_LENGTH,
+  LINK_TYPES,
+  UUID_PATTERN,
+  buildLinkPayload,
+  documentLinks,
+  emptyLinkForm,
+  linkHref,
+  linkReference,
+  linkTypeBook,
+  linkTypeDefinition,
+  linkTypeEndpoint,
+  linkTypeLabel,
+  linkTypeTone,
+  normalizeLinkedType,
+  validateLinkForm
+} from './documentLinks.js';
 import { navigate, recordHref } from './navigation.js';
-
-const TENANT = '11111111-1111-7111-8111-111111111111';
-const API_BASE = '/api/v1/documents';
 
 // SPEC 11.6.5 DocumentType.
 const DOCUMENT_TYPES = [
@@ -45,8 +61,7 @@ const TABS = [
 ];
 
 const EMPTY_FORM = { title: '', documentType: 'POLICY', classification: 'INTERNAL', retentionUntil: '' };
-
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const EMPTY_LINK_FORM = emptyLinkForm();
 
 function readUrlState() {
   if (typeof window === 'undefined') return { record: '', create: false };
@@ -113,52 +128,6 @@ const DIALOG_STYLE = {
   boxShadow: '0 24px 70px rgba(11, 46, 79, 0.28)'
 };
 
-const api = {
-  documents: {
-    list: () => request(API_BASE),
-    get: (documentId) => request(`${API_BASE}/${documentId}`),
-    create: (body) => request(API_BASE, { method: 'POST', body: JSON.stringify(body) }),
-    changeStatus: (documentId, status) =>
-      request(`${API_BASE}/${documentId}/status`, {
-        method: 'POST',
-        body: JSON.stringify({ status })
-      })
-  }
-};
-
-async function readError(response) {
-  try {
-    const body = await response.json();
-    if (body && body.code) {
-      return `${body.code}: ${body.message}`;
-    }
-    if (body && (body.detail || body.message)) {
-      return body.detail || body.message;
-    }
-  } catch (ignored) {
-    // The API returns a JSON error envelope; fall back to the status otherwise.
-  }
-  return `Request failed with status ${response.status}`;
-}
-
-async function request(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: {
-      'X-EIA-Tenant': TENANT,
-      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-      ...(options.headers || {})
-    }
-  });
-  if (!response.ok) {
-    throw new Error(await readError(response));
-  }
-  if (response.status === 204) {
-    return null;
-  }
-  return response.json();
-}
-
 function statusTone(status) {
   if (status === 'ACTIVE') return 'green';
   if (['REJECTED', 'FAILED'].includes(status)) return 'red';
@@ -195,6 +164,16 @@ function StatusPill({ status }) {
   return <span className={`eia-pill ${statusTone(status)}`}>{status}</span>;
 }
 
+function LinkTypeBadge({ type }) {
+  return <span className={`eia-badge ${linkTypeTone(type)}`.trim()}>{type}</span>;
+}
+
+/** Follows a cross-vertical link inside the federated shell. */
+function openRecordLink(event) {
+  event.preventDefault();
+  navigate(event.currentTarget.getAttribute('href'));
+}
+
 function Field({ label, htmlFor, className = '', children }) {
   return (
     <div className={`eia-field ${className}`.trim()}>
@@ -219,6 +198,11 @@ export default function App() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [queueFilter, setQueueFilter] = useState('');
+  const [linkOpen, setLinkOpen] = useState(false);
+  const [linkForm, setLinkForm] = useState(EMPTY_LINK_FORM);
+  const [linkBusy, setLinkBusy] = useState(false);
+  const [linkError, setLinkError] = useState('');
+  const [removingLinkId, setRemovingLinkId] = useState('');
 
   const documentsRef = useRef([]);
   const registerOpenRef = useRef(false);
@@ -226,11 +210,20 @@ export default function App() {
 
   const selectedDocument = documents.find((document) => document.id === selectedId) || null;
   const filteredDocuments = filterDocuments(documents, queueFilter);
+  const linkDefinition = linkTypeDefinition(linkForm.linkedType);
+  const linkIsManual = !linkDefinition || linkDefinition.manual;
 
   async function load() {
     const rows = await api.documents.list();
     const list = Array.isArray(rows) ? rows : [];
-    setDocuments(list);
+    setDocuments((current) =>
+      list.map((row) => {
+        const previous = current.find((document) => document.id === row.id);
+        return previous && !Array.isArray(row.links) && Array.isArray(previous.links)
+          ? { ...row, links: previous.links }
+          : row;
+      })
+    );
     return list;
   }
 
@@ -356,25 +349,54 @@ export default function App() {
 
     let alive = true;
     setDetailLoading(true);
-    api.documents
-      .get(selectedId)
-      .then((record) => {
-        if (!alive || !record || !record.id) return;
-        setDocuments((current) => {
-          if (current.some((document) => document.id === record.id)) {
-            return current.map((document) =>
-              document.id === record.id ? { ...document, ...record } : document
-            );
-          }
-          return [record, ...current];
-        });
-      })
-      .catch((cause) => {
+
+    (async () => {
+      let record = null;
+      try {
+        record = await api.documents.get(selectedId);
+      } catch (cause) {
         if (alive) setError(cause.message);
-      })
-      .finally(() => {
-        if (alive) setDetailLoading(false);
+        return;
+      }
+      if (!alive || !record || !record.id) return;
+
+      setDocuments((current) => {
+        if (current.some((document) => document.id === record.id)) {
+          return current.map((document) => {
+            if (document.id !== record.id) return document;
+            const merged = { ...document, ...record };
+            // A list projection may omit links; keep the links already read
+            // from the document instead of blanking the Associations tab.
+            if (!Array.isArray(record.links) && Array.isArray(document.links)) {
+              merged.links = document.links;
+            }
+            return merged;
+          });
+        }
+        return [record, ...current];
       });
+
+      // The document projection does not embed links; the association
+      // collection is part of the same record and is read explicitly. A
+      // projection that already embedded a non-empty list is authoritative,
+      // and an older API without the route leaves the embedded list in place.
+      const embedded = Array.isArray(record.links) ? record.links : [];
+      if (embedded.length > 0) return;
+      try {
+        const links = await api.links.list(selectedId);
+        if (alive && Array.isArray(links)) {
+          setDocuments((current) =>
+            current.map((document) =>
+              document.id === selectedId ? { ...document, links } : document
+            )
+          );
+        }
+      } catch {
+        // Links are optional for an older expert; the record still renders.
+      }
+    })().finally(() => {
+      if (alive) setDetailLoading(false);
+    });
 
     return () => {
       alive = false;
@@ -393,6 +415,27 @@ export default function App() {
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [registerOpen, registerBusy, selectedId]);
+
+  useEffect(() => {
+    if (!linkOpen) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape' && !linkBusy) {
+        setLinkOpen(false);
+        setLinkError('');
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [linkOpen, linkBusy]);
+
+  useEffect(() => {
+    // The add-link form belongs to one document; never carry a half-selected
+    // record across a queue change.
+    setLinkOpen(false);
+    setLinkForm(EMPTY_LINK_FORM);
+    setLinkError('');
+    setRemovingLinkId('');
+  }, [selectedId]);
 
   function update(field) {
     return (event) => setForm((current) => ({ ...current, [field]: event.target.value }));
@@ -503,7 +546,141 @@ export default function App() {
     }
   }
 
+  function openLinkDialog() {
+    setLinkForm(EMPTY_LINK_FORM);
+    setLinkError('');
+    setLinkOpen(true);
+  }
+
+  function closeLinkDialog() {
+    if (linkBusy) return;
+    setLinkOpen(false);
+    setLinkError('');
+  }
+
+  function changeLinkType(event) {
+    const linkedType = normalizeLinkedType(event.target.value) || event.target.value;
+    setLinkForm({ ...EMPTY_LINK_FORM, linkedType });
+    setLinkError('');
+  }
+
+  function updateManualLink(field) {
+    return (event) => {
+      const value = event.target.value;
+      setLinkForm((current) => ({ ...current, [field]: value }));
+      setLinkError('');
+    };
+  }
+
+  function selectLinkedRecord(id, item) {
+    setLinkForm((current) => ({
+      ...current,
+      linkedId: id || '',
+      linkedReference: id ? item?.label || item?.secondary || '' : ''
+    }));
+    setLinkError('');
+  }
+
+  /**
+   * Applies a link write to the document record. The API may answer with the
+   * updated document, the created link, or 204 on DELETE; each shape is folded
+   * into the same local record so the Associations tab stays in step.
+   */
+  function applyLinkResult(documentId, result, payload, removedId = '') {
+    setDocuments((current) =>
+      current.map((document) => {
+        if (document.id !== documentId) return document;
+        if (Array.isArray(result?.links)) {
+          return { ...document, ...result, links: result.links };
+        }
+        if (removedId) {
+          const links = Array.isArray(document.links)
+            ? document.links.filter((row) => (row.id || row.linkId) !== removedId)
+            : [];
+          return { ...document, links };
+        }
+        if (result?.id === documentId) {
+          return { ...document, ...result };
+        }
+        if (result && (result.linkedType || result.linkedId) && result.id) {
+          return {
+            ...document,
+            links: [...(Array.isArray(document.links) ? document.links : []), result]
+          };
+        }
+        if (payload) {
+          return {
+            ...document,
+            links: [
+              ...(Array.isArray(document.links) ? document.links : []),
+              {
+                id: '',
+                ...payload,
+                addedAt: new Date().toISOString()
+              }
+            ]
+          };
+        }
+        return document;
+      })
+    );
+  }
+
+  async function submitLink(event) {
+    event.preventDefault();
+    if (!selectedDocument) return;
+
+    const issues = validateLinkForm(linkForm);
+    if (issues.length > 0) {
+      setLinkError(issues.join(' '));
+      return;
+    }
+
+    const payload = buildLinkPayload(linkForm);
+    setLinkBusy(true);
+    setLinkError('');
+    setError('');
+    setNotice('');
+    try {
+      const created = await api.links.create(selectedDocument.id, payload);
+      applyLinkResult(selectedDocument.id, created, payload);
+      setLinkOpen(false);
+      setLinkForm(EMPTY_LINK_FORM);
+      setActiveTab('associations');
+      setNotice(`Link added to ${selectedDocument.documentNumber}.`);
+      if (!created || (!Array.isArray(created.links) && !created.id)) {
+        setDetailNonce((value) => value + 1);
+      }
+    } catch (cause) {
+      setLinkError(cause.message);
+    } finally {
+      setLinkBusy(false);
+    }
+  }
+
+  async function removeLink(link) {
+    if (!selectedDocument || removingLinkId) return;
+    if (!link.id) {
+      setError('This link cannot be removed because the API did not return a link id.');
+      return;
+    }
+
+    setRemovingLinkId(link.id);
+    setError('');
+    setNotice('');
+    try {
+      const result = await api.links.remove(selectedDocument.id, link.id);
+      applyLinkResult(selectedDocument.id, result, null, link.id);
+      setNotice(`Link to ${linkReference(link)} removed.`);
+    } catch (cause) {
+      setError(cause.message);
+    } finally {
+      setRemovingLinkId('');
+    }
+  }
+
   function renderOverview(document) {
+    const links = documentLinks(document);
     return (
       <>
         <div className="eia-grid eia-grid-2">
@@ -563,21 +740,57 @@ export default function App() {
           data-testid="related-records"
           style={{ marginTop: 14 }}
         >
-          <h3>Related records</h3>
-          <p className="eia-muted" style={{ marginTop: 4 }}>
-            Related records would link this document to the policies, claims, payments, and parties it
-            evidences. This workbench lists only associations the Document API returns.
-          </p>
-          <div className="eia-empty" data-testid="related-records-empty" style={{ marginTop: 10 }}>
-            <p style={{ marginTop: 0 }}>
-              <strong>No related records are available yet.</strong>
-            </p>
-            <p style={{ marginBottom: 0 }}>
-              Document associations are not yet exposed by this API, so none can be listed here. The
-              workbench does not invent links to other verticals; the document’s metadata and lifecycle
-              are the only references it can show.
-            </p>
+          <div
+            style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}
+          >
+            <h3 style={{ margin: 0 }}>Related records</h3>
+            <button type="button" onClick={openLinkDialog} aria-haspopup="dialog">
+              Add link
+            </button>
           </div>
+          <p className="eia-muted" style={{ marginTop: 4 }}>
+            The business records this evidence is linked to. Each link is stored on the document
+            record; the linked vertical remains the source of truth.
+          </p>
+          {links.length === 0 ? (
+            <div className="eia-empty" data-testid="related-records-empty" style={{ marginTop: 10 }}>
+              <p style={{ marginTop: 0 }}>
+                <strong>No business records are linked yet.</strong>
+              </p>
+              <p style={{ marginBottom: 0 }}>
+                Documents are evidence. Link this document to the claim, policy, contract, party, or
+                payment it evidences; the association is stored on the document record and does not
+                change the linked record.
+              </p>
+            </div>
+          ) : (
+            <ul className="eia-list" data-testid="related-records-list" style={{ marginTop: 10 }}>
+              {links.map((link) => {
+                const href = linkHref(link);
+                const key = link.id || `${link.linkedType}:${link.linkedId}`;
+                return (
+                  <li key={key}>
+                    <span>
+                      <LinkTypeBadge type={link.linkedType} />{' '}
+                      {link.linkedReference || shortId(link.linkedId)}
+                    </span>
+                    {href ? (
+                      <a
+                        href={href}
+                        title={link.linkedId}
+                        data-testid="related-record-link"
+                        onClick={openRecordLink}
+                      >
+                        Open {linkTypeLabel(link.linkedType)} record
+                      </a>
+                    ) : (
+                      <span className="eia-muted">No shell route</span>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
         </section>
       </>
     );
@@ -743,21 +956,104 @@ export default function App() {
   }
 
   function renderAssociations(document) {
+    const links = documentLinks(document);
     return (
       <>
         <div className="eia-section-title">
           <h2>Associations</h2>
-          <span className="eia-muted">0 subjects</span>
+          <div className="eia-actions">
+            <span className="eia-muted" data-testid="link-count">
+              {links.length === 1 ? '1 linked record' : `${links.length} linked records`}
+            </span>
+            <button type="button" onClick={openLinkDialog} aria-haspopup="dialog">
+              Add link
+            </button>
+          </div>
         </div>
-        <div className="eia-empty">
-          <p style={{ marginTop: 0 }}>
-            No associations are recorded for {document.documentNumber}.
-          </p>
-          <p style={{ marginBottom: 0 }}>
-            Associating a document with a policy, claim, payment, or party requires the Document
-            association API, which is not exposed in this build. No association action is available.
-          </p>
-        </div>
+        <p className="eia-muted" style={{ marginTop: 0 }}>
+          These links are carried on the document record. Each points at a record owned by another
+          vertical; the linked record remains the source of truth and is never changed here.
+        </p>
+
+        {links.length === 0 ? (
+          <div className="eia-empty" data-testid="associations-empty">
+            <p style={{ marginTop: 0 }}>
+              <strong>No business records are linked to {document.documentNumber}.</strong>
+            </p>
+            <p style={{ marginBottom: 0 }}>
+              This document is evidence. Link it to the direct claim, assumed claim, policy, contract,
+              party, or payment it evidences. The association is stored on the document record, while
+              the linked business record stays authoritative in its own vertical.
+            </p>
+          </div>
+        ) : (
+          <div className="eia-table-wrap" style={{ marginTop: 10 }}>
+            <table className="eia-table" aria-label="Document links">
+              <thead>
+                <tr>
+                  <th>Type</th>
+                  <th>Reference</th>
+                  <th>Linked record</th>
+                  <th>Added</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {links.map((link) => {
+                  const reference = link.linkedReference || shortId(link.linkedId);
+                  const href = linkHref(link);
+                  const key = link.id || `${link.linkedType}:${link.linkedId}`;
+                  return (
+                    <tr key={key} data-testid="document-link-row">
+                      <td>
+                        <span data-testid="link-type">
+                          <LinkTypeBadge type={link.linkedType} />
+                        </span>
+                      </td>
+                      <td data-testid="link-reference">{reference || '—'}</td>
+                      <td>
+                        {href ? (
+                          <a
+                            href={href}
+                            className="eia-mono"
+                            title={`Open ${linkTypeLabel(link.linkedType)} record ${link.linkedId}`}
+                            data-testid="link-record"
+                            onClick={openRecordLink}
+                          >
+                            {reference}
+                          </a>
+                        ) : (
+                          <span className="eia-mono" title={link.linkedId} data-testid="link-record">
+                            {link.linkedId ? shortId(link.linkedId) : '—'}
+                          </span>
+                        )}
+                      </td>
+                      <td data-testid="link-added">
+                        <time dateTime={link.addedAt || undefined}>{formatTimestamp(link.addedAt)}</time>
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          className="eia-btn-ghost"
+                          onClick={() => removeLink(link)}
+                          disabled={!link.id || removingLinkId === link.id}
+                          data-testid="remove-link"
+                          title={
+                            link.id
+                              ? `Remove link to ${reference || 'record'}`
+                              : 'The API did not return a link id.'
+                          }
+                        >
+                          {removingLinkId === link.id ? 'Removing…' : 'Remove'}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </>
     );
   }
@@ -803,7 +1099,9 @@ export default function App() {
       </header>
 
       {notice && <p role="status" style={{ margin: '0 0 12px' }}>{notice}</p>}
-      {error && !registerOpen && <p role="alert" style={{ margin: '0 0 12px' }}>{error}</p>}
+      {error && !registerOpen && !linkOpen && (
+        <p role="alert" style={{ margin: '0 0 12px' }}>{error}</p>
+      )}
 
       <div className="eia-record-layout">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 }}>
@@ -1087,6 +1385,122 @@ export default function App() {
             </form>
 
             {error && <p role="alert" style={{ margin: '10px 0 0' }}>{error}</p>}
+          </section>
+        </div>
+      )}
+
+      {linkOpen && selectedDocument && (
+        <div
+          style={OVERLAY_STYLE}
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !linkBusy) closeLinkDialog();
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="add-link-title"
+            className="eia-card"
+            style={DIALOG_STYLE}
+          >
+            <div className="eia-record-title">
+              <div>
+                <h2 id="add-link-title" style={{ margin: 0 }}>Add link</h2>
+                <p className="eia-record-subtitle">
+                  Link {selectedDocument.documentNumber} to the business record it evidences. The
+                  linked record stays owned by its vertical.
+                </p>
+              </div>
+              <button
+                type="button"
+                className="eia-btn-ghost"
+                onClick={closeLinkDialog}
+                disabled={linkBusy}
+              >
+                Close
+              </button>
+            </div>
+
+            <form
+              className="eia-form-grid"
+              aria-label="Add document link"
+              onSubmit={submitLink}
+              noValidate
+              style={{ marginTop: 16 }}
+            >
+              <Field label="Linked type" htmlFor="link-type" className="span-2">
+                <select
+                  id="link-type"
+                  value={linkForm.linkedType}
+                  onChange={changeLinkType}
+                  disabled={linkBusy}
+                  autoFocus
+                >
+                  {LINK_TYPES.map((type) => (
+                    <option key={type.value} value={type.value}>{type.value}</option>
+                  ))}
+                </select>
+              </Field>
+
+              {linkIsManual ? (
+                <>
+                  <Field label="Reference" htmlFor="link-reference" className="span-2">
+                    <input
+                      id="link-reference"
+                      value={linkForm.linkedReference}
+                      maxLength={LINK_REFERENCE_MAX_LENGTH}
+                      onChange={updateManualLink('linkedReference')}
+                      placeholder="e.g. LEGACY-REF-0001"
+                      autoComplete="off"
+                      disabled={linkBusy}
+                    />
+                  </Field>
+                  <Field label="UUID" htmlFor="link-id">
+                    <input
+                      id="link-id"
+                      value={linkForm.linkedId}
+                      onChange={updateManualLink('linkedId')}
+                      placeholder="00000000-0000-0000-0000-000000000000"
+                      autoComplete="off"
+                      disabled={linkBusy}
+                    />
+                  </Field>
+                </>
+              ) : (
+                <div className="eia-field span-2">
+                  <label>Linked record</label>
+                  <EntityPicker
+                    key={linkForm.linkedType}
+                    endpoint={linkTypeEndpoint(linkForm.linkedType)}
+                    book={linkTypeBook(linkForm.linkedType)}
+                    value={linkForm.linkedId}
+                    valueLabel={linkForm.linkedReference}
+                    onChange={selectLinkedRecord}
+                    disabled={linkBusy}
+                  />
+                </div>
+              )}
+
+              <div className="eia-actions span-3" style={{ justifyContent: 'flex-end' }}>
+                <button
+                  type="button"
+                  className="eia-btn-secondary"
+                  onClick={closeLinkDialog}
+                  disabled={linkBusy}
+                >
+                  Cancel
+                </button>
+                <button type="submit" disabled={linkBusy}>
+                  {linkBusy ? 'Adding…' : 'Add link'}
+                </button>
+              </div>
+            </form>
+
+            {linkError && (
+              <p role="alert" data-testid="link-error" style={{ margin: '10px 0 0' }}>
+                {linkError}
+              </p>
+            )}
           </section>
         </div>
       )}
