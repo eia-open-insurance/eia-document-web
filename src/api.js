@@ -1,3 +1,5 @@
+import { ACTIVITY_LIMIT, aggregateEventsEndpoint } from './events.js';
+
 export const TENANT = '11111111-1111-7111-8111-111111111111';
 export const API_BASE = '/api/v1/documents';
 
@@ -80,5 +82,14 @@ export const api = {
         `${API_BASE}/${encodeURIComponent(documentId)}/links/${encodeURIComponent(linkId)}`,
         { method: 'DELETE' }
       )
+  },
+  events: {
+    /**
+     * The append-only activity stream for one document aggregate. The event
+     * service is a separate platform service; a failure here is contained by
+     * the caller and never blocks the document record.
+     */
+    aggregate: (documentId, limit = ACTIVITY_LIMIT) =>
+      request(aggregateEventsEndpoint(documentId, limit))
   }
 };

@@ -802,3 +802,106 @@ main [role="status"] {
 }
 .eia-related-record:hover { border-color: var(--eia-blue); color: var(--eia-blue); }
 .eia-related-record b { font-weight: 700; }
+
+/* Document record activity: an event-derived, append-only timeline. */
+.eia-activity { padding: 14px 16px; }
+.eia-activity-note { font-size: 11px; line-height: 1.5; }
+
+.eia-timeline {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+}
+
+.eia-timeline-item {
+  position: relative;
+  padding: 0 0 15px 22px;
+}
+
+.eia-timeline-item:last-child { padding-bottom: 0; }
+
+.eia-timeline-item::before {
+  content: '';
+  position: absolute;
+  top: 4px;
+  left: 2px;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--eia-blue);
+  border-radius: 50%;
+  background: #fff;
+}
+
+.eia-timeline-item::after {
+  content: '';
+  position: absolute;
+  top: 18px;
+  bottom: 0;
+  left: 7px;
+  width: 2px;
+  background: var(--eia-line);
+}
+
+.eia-timeline-item:last-child::after { display: none; }
+
+.eia-timeline-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.eia-activity-time {
+  color: var(--eia-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.eia-activity-type {
+  color: var(--eia-navy);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.eia-activity-version {
+  color: var(--eia-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.eia-activity-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  list-style: none;
+  margin: 7px 0 0;
+  padding: 0;
+}
+
+.eia-activity-fact {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  color: var(--eia-ink);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.eia-activity-fact-label {
+  color: var(--eia-muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  text-transform: uppercase;
+}
+
+.eia-activity-fact b { font-weight: 600; overflow-wrap: anywhere; }
+
+.eia-activity-raw {
+  margin: 6px 0 0 !important;
+  color: #7a8d9f;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}

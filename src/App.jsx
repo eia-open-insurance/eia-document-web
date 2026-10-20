@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import './ui.css';
 import { api } from './api.js';
+import ActivityTimeline from './ActivityTimeline.jsx';
 import EntityPicker from './EntityPicker.jsx';
 import {
   LINK_REFERENCE_MAX_LENGTH,
@@ -20,6 +21,7 @@ import {
   validateLinkForm
 } from './documentLinks.js';
 import { navigate, recordHref } from './navigation.js';
+import { activityEvents } from './events.js';
 
 // SPEC 11.6.5 DocumentType.
 const DOCUMENT_TYPES = [
@@ -57,11 +59,13 @@ const TABS = [
   { id: 'overview', label: 'Overview' },
   { id: 'lifecycle', label: 'Lifecycle' },
   { id: 'retention', label: 'Retention' },
-  { id: 'associations', label: 'Associations' }
+  { id: 'associations', label: 'Associations' },
+  { id: 'activity', label: 'Activity' }
 ];
 
 const EMPTY_FORM = { title: '', documentType: 'POLICY', classification: 'INTERNAL', retentionUntil: '' };
 const EMPTY_LINK_FORM = emptyLinkForm();
+const EMPTY_ACTIVITY = { recordId: '', items: [], loading: false, error: '' };
 
 function readUrlState() {
   if (typeof window === 'undefined') return { record: '', create: false };
@@ -203,13 +207,23 @@ export default function App() {
   const [linkBusy, setLinkBusy] = useState(false);
   const [linkError, setLinkError] = useState('');
   const [removingLinkId, setRemovingLinkId] = useState('');
+  const [activity, setActivity] = useState(EMPTY_ACTIVITY);
+  const [activityNonce, setActivityNonce] = useState(0);
 
   const documentsRef = useRef([]);
   const registerOpenRef = useRef(false);
   const applyingUrlRef = useRef(false);
+  const activityRequestRef = useRef(0);
 
   const selectedDocument = documents.find((document) => document.id === selectedId) || null;
   const filteredDocuments = filterDocuments(documents, queueFilter);
+  // Never show one document's events under another document's header while a
+  // selection change is still in flight.
+  const activityView = !selectedDocument
+    ? EMPTY_ACTIVITY
+    : activity.recordId === selectedDocument.id
+      ? activity
+      : { recordId: selectedDocument.id, items: [], loading: true, error: '' };
   const linkDefinition = linkTypeDefinition(linkForm.linkedType);
   const linkIsManual = !linkDefinition || linkDefinition.manual;
 
@@ -403,6 +417,51 @@ export default function App() {
     };
   }, [selectedId, detailNonce]);
 
+  /**
+   * Activity is derived from the platform event stream, keyed by the document
+   * id that owns the aggregate. It loads as soon as a record is selected and
+   * stays card-local: a slow or unavailable event service never blocks the
+   * document record or changes its state.
+   */
+  useEffect(() => {
+    const recordId = selectedId || '';
+    const requestId = activityRequestRef.current + 1;
+    activityRequestRef.current = requestId;
+
+    if (!recordId) {
+      setActivity(EMPTY_ACTIVITY);
+      return undefined;
+    }
+
+    let alive = true;
+    setActivity({ recordId, items: [], loading: true, error: '' });
+
+    api.events
+      .aggregate(recordId)
+      .then((body) => {
+        if (!alive || activityRequestRef.current !== requestId) return;
+        setActivity({
+          recordId,
+          items: activityEvents(body),
+          loading: false,
+          error: ''
+        });
+      })
+      .catch(() => {
+        if (!alive || activityRequestRef.current !== requestId) return;
+        setActivity({
+          recordId,
+          items: [],
+          loading: false,
+          error: 'Activity timeline is temporarily unavailable.'
+        });
+      });
+
+    return () => {
+      alive = false;
+    };
+  }, [selectedId, activityNonce]);
+
   useEffect(() => {
     if (!registerOpen) return undefined;
     const onKeyDown = (event) => {
@@ -445,7 +504,10 @@ export default function App() {
     setError('');
     try {
       await load();
-      if (selectedId) setDetailNonce((value) => value + 1);
+      if (selectedId) {
+        setDetailNonce((value) => value + 1);
+        setActivityNonce((value) => value + 1);
+      }
     } catch (cause) {
       setError(cause.message);
     }
@@ -539,6 +601,7 @@ export default function App() {
         await load();
       }
       setNotice(`${selectedDocument.documentNumber} moved to ${target}.`);
+      setActivityNonce((value) => value + 1);
     } catch (cause) {
       setError(cause.message);
     } finally {
@@ -648,6 +711,7 @@ export default function App() {
       setLinkForm(EMPTY_LINK_FORM);
       setActiveTab('associations');
       setNotice(`Link added to ${selectedDocument.documentNumber}.`);
+      setActivityNonce((value) => value + 1);
       if (!created || (!Array.isArray(created.links) && !created.id)) {
         setDetailNonce((value) => value + 1);
       }
@@ -672,6 +736,7 @@ export default function App() {
       const result = await api.links.remove(selectedDocument.id, link.id);
       applyLinkResult(selectedDocument.id, result, null, link.id);
       setNotice(`Link to ${linkReference(link)} removed.`);
+      setActivityNonce((value) => value + 1);
     } catch (cause) {
       setError(cause.message);
     } finally {
@@ -1058,6 +1123,23 @@ export default function App() {
     );
   }
 
+  function renderActivity() {
+    return (
+      <>
+        <div className="eia-section-title">
+          <h2>Activity</h2>
+          <span className="eia-muted">Newest first · derived from platform events</span>
+        </div>
+        <ActivityTimeline
+          items={activityView.items}
+          loading={activityView.loading}
+          error={activityView.error}
+          onRefresh={() => setActivityNonce((value) => value + 1)}
+        />
+      </>
+    );
+  }
+
   function renderTab() {
     if (!selectedDocument) return null;
     switch (activeTab) {
@@ -1067,6 +1149,8 @@ export default function App() {
         return renderRetention(selectedDocument);
       case 'associations':
         return renderAssociations(selectedDocument);
+      case 'activity':
+        return renderActivity();
       default:
         return renderOverview(selectedDocument);
     }
