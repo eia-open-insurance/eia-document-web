@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import './ui.css';
+import { navigate, recordHref } from './navigation.js';
 
 const TENANT = '11111111-1111-7111-8111-111111111111';
 const API_BASE = '/api/v1/documents';
@@ -44,6 +45,56 @@ const TABS = [
 ];
 
 const EMPTY_FORM = { title: '', documentType: 'POLICY', classification: 'INTERNAL', retentionUntil: '' };
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function readUrlState() {
+  if (typeof window === 'undefined') return { record: '', create: false };
+  const params = new URLSearchParams(window.location.search);
+  return { record: params.get('record') || '', create: params.get('new') === '1' };
+}
+
+/**
+ * The remote is mounted either at the shell route (/document) or directly at
+ * the dev-server root (/). Only treat the URL as document state on those
+ * routes so a future cross-link to /party or /policy is not read as a record.
+ */
+function onDocumentRoute() {
+  if (typeof window === 'undefined') return false;
+  const path = window.location.pathname.replace(/\/+$/, '');
+  return path === '' || path === '/' || path.endsWith('/document');
+}
+
+/**
+ * Keeps the address bar in step with the selected document and the register
+ * dialog. `notify: false` leaves routing to the shell; the workbench already
+ * applied the same state locally.
+ */
+function writeUrl({ record = '', create = false, replace = false } = {}) {
+  if (typeof window === 'undefined' || !onDocumentRoute()) return;
+  const base = recordHref(window.location.pathname || '/', record);
+  const target = create ? `${base}${record ? '&' : '?'}new=1` : base;
+  if (target === `${window.location.pathname}${window.location.search}`) return;
+  navigate(target, { replace, notify: false });
+}
+
+function humanize(value) {
+  return String(value || '').replace(/_/g, ' ');
+}
+
+function filterDocuments(documents, filter) {
+  const term = filter.trim().toLowerCase();
+  if (!term) return documents;
+  return documents.filter((document) =>
+    [
+      document.documentNumber,
+      document.title,
+      document.documentType,
+      humanize(document.documentType),
+      document.status
+    ].some((value) => String(value || '').toLowerCase().includes(term))
+  );
+}
 
 const OVERLAY_STYLE = {
   position: 'fixed',
@@ -167,8 +218,14 @@ export default function App() {
   const [statusBusy, setStatusBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [queueFilter, setQueueFilter] = useState('');
+
+  const documentsRef = useRef([]);
+  const registerOpenRef = useRef(false);
+  const applyingUrlRef = useRef(false);
 
   const selectedDocument = documents.find((document) => document.id === selectedId) || null;
+  const filteredDocuments = filterDocuments(documents, queueFilter);
 
   async function load() {
     const rows = await api.documents.list();
@@ -177,23 +234,116 @@ export default function App() {
     return list;
   }
 
+  /**
+   * Applies ?record= and ?new=1. A record that is not in the queue is fetched
+   * by id so a global-search link can open a document the list does not hold.
+   */
+  async function applyUrlState(rows, { initial = false } = {}) {
+    if (!onDocumentRoute()) return;
+    const { record, create } = readUrlState();
+
+    if (create) {
+      if (!registerOpenRef.current) setForm(EMPTY_FORM);
+      setRegisterOpen(true);
+      setError('');
+      return;
+    }
+
+    if (!record) {
+      if (!initial) {
+        setRegisterOpen(false);
+        setError('');
+      }
+      return;
+    }
+
+    setRegisterOpen(false);
+    if (applyingUrlRef.current) return;
+
+    const queue = Array.isArray(rows) && rows.length > 0 ? rows : documentsRef.current;
+    const known = queue.find(
+      (document) => document.id === record || document.documentNumber === record
+    );
+    if (known) {
+      setSelectedId(known.id);
+      setError('');
+      return;
+    }
+
+    if (!UUID_PATTERN.test(record)) {
+      setError(`Document “${record}” was not found in the document queue.`);
+      return;
+    }
+
+    applyingUrlRef.current = true;
+    try {
+      const document = await api.documents.get(record);
+      if (document?.id) {
+        setDocuments((current) =>
+          current.some((row) => row.id === document.id) ? current : [document, ...current]
+        );
+        setSelectedId(document.id);
+        setActiveTab('overview');
+        setError('');
+      }
+    } catch (cause) {
+      setError(`Document ${record} could not be loaded: ${cause.message}`);
+      setSelectedId((current) => current || documentsRef.current[0]?.id || null);
+    } finally {
+      applyingUrlRef.current = false;
+    }
+  }
+
+  useEffect(() => {
+    registerOpenRef.current = registerOpen;
+  }, [registerOpen]);
+
   useEffect(() => {
     let alive = true;
+    if (onDocumentRoute() && readUrlState().create) {
+      setForm(EMPTY_FORM);
+      setRegisterOpen(true);
+    }
+
+    const onPopState = () => {
+      applyUrlState(documentsRef.current);
+    };
+    window.addEventListener('popstate', onPopState);
+
     load()
-      .catch((cause) => {
-        if (alive) setError(cause.message);
+      .then((rows) => {
+        if (!alive) return;
+        setLoading(false);
+        applyUrlState(rows, { initial: true });
       })
-      .finally(() => {
-        if (alive) setLoading(false);
+      .catch((cause) => {
+        if (!alive) return;
+        setLoading(false);
+        setError(cause.message);
       });
+
     return () => {
       alive = false;
+      window.removeEventListener('popstate', onPopState);
     };
   }, []);
 
   useEffect(() => {
+    documentsRef.current = documents;
     setSelectedId((current) => {
       if (current && documents.some((document) => document.id === current)) return current;
+
+      const requested = readUrlState().record;
+      if (requested && onDocumentRoute()) {
+        const match = documents.find(
+          (document) => document.id === requested || document.documentNumber === requested
+        );
+        if (match) return match.id;
+        // The detail lookup owns unknown UUIDs; keep the previous selection
+        // instead of jumping to the first row while it is in flight.
+        if (UUID_PATTERN.test(requested)) return current;
+      }
+
       return documents[0]?.id || null;
     });
   }, [documents]);
@@ -237,11 +387,12 @@ export default function App() {
       if (event.key === 'Escape' && !registerBusy) {
         setRegisterOpen(false);
         setError('');
+        writeUrl({ record: selectedId || '' });
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [registerOpen, registerBusy]);
+  }, [registerOpen, registerBusy, selectedId]);
 
   function update(field) {
     return (event) => setForm((current) => ({ ...current, [field]: event.target.value }));
@@ -262,18 +413,21 @@ export default function App() {
     setSelectedId(document.id);
     setError('');
     setNotice('');
+    writeUrl({ record: document.id });
   }
 
   function openRegister() {
     setForm(EMPTY_FORM);
     setError('');
     setRegisterOpen(true);
+    writeUrl({ record: selectedId || '', create: true });
   }
 
   function closeRegister() {
     if (registerBusy) return;
     setRegisterOpen(false);
     setError('');
+    writeUrl({ record: selectedId || '' });
   }
 
   async function submit(event) {
@@ -300,6 +454,9 @@ export default function App() {
           }
           return [created, ...current];
         });
+        writeUrl({ record: created.id });
+      } else {
+        writeUrl({ record: selectedId || '' });
       }
       setActiveTab('overview');
       setNotice('Document registered.');
@@ -348,42 +505,81 @@ export default function App() {
 
   function renderOverview(document) {
     return (
-      <div className="eia-grid eia-grid-2">
-        <section className="eia-card" aria-label="Document details">
-          <h3>Document details</h3>
-          <dl className="eia-kv" style={{ marginTop: 8 }}>
-            <dt>Document number</dt>
-            <dd className="eia-mono">{document.documentNumber}</dd>
-            <dt>Title</dt>
-            <dd>{document.title}</dd>
-            <dt>Document type</dt>
-            <dd>{document.documentType}</dd>
-            <dt>Classification</dt>
-            <dd>{document.classification}</dd>
-            <dt>Status</dt>
-            <dd><StatusPill status={document.status} /></dd>
-            <dt>Version</dt>
-            <dd>{document.version ?? '—'}</dd>
-          </dl>
-        </section>
+      <>
+        <div className="eia-grid eia-grid-2">
+          <section className="eia-card" aria-label="Document details">
+            <h3>Document details</h3>
+            <dl className="eia-kv" style={{ marginTop: 8 }}>
+              <dt>Document number</dt>
+              <dd className="eia-mono">{document.documentNumber}</dd>
+              <dt>Title</dt>
+              <dd>{document.title}</dd>
+              <dt>Document type</dt>
+              <dd>{document.documentType}</dd>
+              <dt>Classification</dt>
+              <dd>{document.classification}</dd>
+              <dt>Status</dt>
+              <dd><StatusPill status={document.status} /></dd>
+              <dt>Version</dt>
+              <dd>{document.version ?? '—'}</dd>
+            </dl>
+          </section>
 
-        <section className="eia-card" aria-label="Record state">
-          <h3>Record state</h3>
-          <dl className="eia-kv" style={{ marginTop: 8 }}>
-            <dt>Record ID</dt>
-            <dd className="eia-mono" title={document.id}>{shortId(document.id)}</dd>
-            <dt>Registered</dt>
-            <dd>{formatTimestamp(document.createdAt)}</dd>
-            <dt>Last updated</dt>
-            <dd>{formatTimestamp(document.updatedAt)}</dd>
-            <dt>Retention until</dt>
-            <dd>{document.retentionUntil || 'Not set'}</dd>
-          </dl>
-          <p className="eia-muted" style={{ margin: '12px 0 0' }}>
-            A document is evidence, not truth. Business facts stay with the owning vertical.
+          <section className="eia-card" aria-label="Record state">
+            <h3>Record state</h3>
+            <dl className="eia-kv" style={{ marginTop: 8 }}>
+              <dt>Record ID</dt>
+              <dd className="eia-mono" title={document.id}>{shortId(document.id)}</dd>
+              <dt>Registered</dt>
+              <dd>{formatTimestamp(document.createdAt)}</dd>
+              <dt>Last updated</dt>
+              <dd>{formatTimestamp(document.updatedAt)}</dd>
+              <dt>Retention until</dt>
+              <dd>{document.retentionUntil || 'Not set'}</dd>
+            </dl>
+            <p className="eia-muted" style={{ margin: '12px 0 0' }}>
+              Documents are evidence, not business facts. Business facts stay with the owning vertical.
+            </p>
+          </section>
+        </div>
+
+        <section
+          className="eia-context-panel"
+          aria-label="Why this matters"
+          data-testid="why-this-matters"
+        >
+          <h4>Why this matters</h4>
+          <p>
+            Documents are evidence, not business facts. They reference records in other verticals and
+            never mutate them — a policy, claim, payment, or party stays owned by its vertical, which
+            remains the source of truth for every business fact the document evidences.
           </p>
         </section>
-      </div>
+
+        <section
+          className="eia-card"
+          id="related-records"
+          aria-label="Related records"
+          data-testid="related-records"
+          style={{ marginTop: 14 }}
+        >
+          <h3>Related records</h3>
+          <p className="eia-muted" style={{ marginTop: 4 }}>
+            Related records would link this document to the policies, claims, payments, and parties it
+            evidences. This workbench lists only associations the Document API returns.
+          </p>
+          <div className="eia-empty" data-testid="related-records-empty" style={{ marginTop: 10 }}>
+            <p style={{ marginTop: 0 }}>
+              <strong>No related records are available yet.</strong>
+            </p>
+            <p style={{ marginBottom: 0 }}>
+              Document associations are not yet exposed by this API, so none can be listed here. The
+              workbench does not invent links to other verticals; the document’s metadata and lifecycle
+              are the only references it can show.
+            </p>
+          </div>
+        </section>
+      </>
     );
   }
 
@@ -610,42 +806,84 @@ export default function App() {
       {error && !registerOpen && <p role="alert" style={{ margin: '0 0 12px' }}>{error}</p>}
 
       <div className="eia-record-layout">
-        <aside className="eia-record-list" aria-label="Document queue">
-          <div className="eia-record-list-head">
-            <strong>Document queue</strong>
-            <span className="eia-muted">{loading ? '…' : documents.length}</span>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 }}>
+          <div
+            className="eia-queue-search"
+            role="search"
+            aria-label="Filter the document queue"
+            style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+          >
+            <div className="eia-search-box" style={{ height: 38, flex: 1 }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2" />
+                <path d="m20 20-3.4-3.4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+              </svg>
+              <input
+                type="search"
+                id="document-queue-filter"
+                value={queueFilter}
+                onChange={(event) => setQueueFilter(event.target.value)}
+                placeholder="Filter documents by number, title, type, or status…"
+                aria-label="Filter documents by number, title, type, or status"
+                autoComplete="off"
+                data-testid="document-filter"
+              />
+            </div>
+            {queueFilter && (
+              <button type="button" className="eia-btn-ghost" onClick={() => setQueueFilter('')}>
+                Clear
+              </button>
+            )}
           </div>
-          {loading && <div className="empty">Loading documents…</div>}
-          {!loading && documents.length === 0 && (
-            <div className="empty">No documents registered yet.</div>
-          )}
-          {documents.map((document) => (
-            <button
-              key={document.id}
-              type="button"
-              className={document.id === selectedId ? 'selected' : ''}
-              aria-pressed={document.id === selectedId}
-              aria-label={`Open record ${document.documentNumber}`}
-              onClick={() => selectDocument(document)}
-            >
-              <span className="record-primary">{document.documentNumber}</span>
-              <span
-                className="record-secondary"
-                style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-                title={document.title}
-              >
-                {document.title}
+
+          <aside className="eia-record-list" aria-label="Document queue">
+            <div className="eia-record-list-head">
+              <strong>Document queue</strong>
+              <span className="eia-muted" data-testid="queue-filter-count">
+                {loading
+                  ? '…'
+                  : queueFilter
+                    ? `${filteredDocuments.length} of ${documents.length} documents`
+                    : documents.length}
               </span>
-              <span
-                className="record-secondary"
-                style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}
+            </div>
+            {loading && <div className="empty">Loading documents…</div>}
+            {!loading && documents.length === 0 && (
+              <div className="empty">No documents registered yet.</div>
+            )}
+            {!loading && documents.length > 0 && filteredDocuments.length === 0 && (
+              <div className="empty" data-testid="queue-filter-empty">
+                No documents match “{queueFilter.trim()}”. Clear the filter to see the full queue.
+              </div>
+            )}
+            {filteredDocuments.map((document) => (
+              <button
+                key={document.id}
+                type="button"
+                className={document.id === selectedId ? 'selected' : ''}
+                aria-pressed={document.id === selectedId}
+                aria-label={`Open record ${document.documentNumber}`}
+                onClick={() => selectDocument(document)}
               >
-                <span>{document.documentType}</span>
-                <StatusPill status={document.status} />
-              </span>
-            </button>
-          ))}
-        </aside>
+                <span className="record-primary">{document.documentNumber}</span>
+                <span
+                  className="record-secondary"
+                  style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                  title={document.title}
+                >
+                  {document.title}
+                </span>
+                <span
+                  className="record-secondary"
+                  style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}
+                >
+                  <span>{document.documentType}</span>
+                  <StatusPill status={document.status} />
+                </span>
+              </button>
+            ))}
+          </aside>
+        </div>
 
         <section className="eia-record-panel" aria-label="Document record" aria-busy={detailLoading}>
           {!selectedDocument ? (
