@@ -34,6 +34,29 @@ npm start
 - `npm run build` produces the production bundle in `dist/`.
 - `npm test` runs the Playwright test; the API is mocked in the test.
 
+## Content (evidence file)
+
+A document's metadata remains the source of truth; its stored file is evidence
+attached by the Document service:
+
+- `PUT /api/v1/documents/{documentId}/content` receives the raw file bytes,
+  with `Content-Type` and `X-File-Name` describing the file (never JSON).
+- `GET /api/v1/documents/{documentId}/content` returns the authorized bytes.
+- `GET /api/v1/documents/{documentId}/content/metadata` returns the file name,
+  media type, size, SHA-256, and upload timestamp; a 404 means no file is
+  stored.
+
+The remote surfaces this in the **File** tab. With content, it renders the
+metadata and downloads the bytes as a blob through an object URL. Without
+content, it shows "No file stored" and offers an upload input and drag/drop.
+Files are validated client-side at 10 MiB, upload progress is shown through
+`XMLHttpRequest`, and read/upload/download failures stay contained in the tab.
+The register-document dialog accepts an optional file and uploads it after the
+metadata is created; a failed upload leaves the registered document intact and
+switches to the File tab so it can be retried. `tests/content.spec.js` covers
+the upload headers and raw body, metadata rendering, download, empty state,
+oversized rejection, and upload/metadata errors.
+
 ## Verification
 
 - Lint and format

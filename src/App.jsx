@@ -2,7 +2,9 @@ import React, { useEffect, useRef, useState } from 'react';
 import './ui.css';
 import { api } from './api.js';
 import ActivityTimeline from './ActivityTimeline.jsx';
+import DocumentContent from './DocumentContent.jsx';
 import EntityPicker from './EntityPicker.jsx';
+import { MAX_CONTENT_LABEL, formatBytes, validateContentFile } from './documentContent.js';
 import {
   LINK_REFERENCE_MAX_LENGTH,
   LINK_TYPES,
@@ -57,6 +59,7 @@ const NEXT_STATUSES = {
 
 const TABS = [
   { id: 'overview', label: 'Overview' },
+  { id: 'file', label: 'File' },
   { id: 'lifecycle', label: 'Lifecycle' },
   { id: 'retention', label: 'Retention' },
   { id: 'associations', label: 'Associations' },
@@ -197,6 +200,10 @@ export default function App() {
   const [form, setForm] = useState(EMPTY_FORM);
   const [registerOpen, setRegisterOpen] = useState(false);
   const [registerBusy, setRegisterBusy] = useState(false);
+  const [registerFile, setRegisterFile] = useState(null);
+  const [registerFileError, setRegisterFileError] = useState('');
+  const [registerProgress, setRegisterProgress] = useState(null);
+  const [registerFileKey, setRegisterFileKey] = useState(0);
   const [statusTargets, setStatusTargets] = useState({});
   const [statusBusy, setStatusBusy] = useState(false);
   const [error, setError] = useState('');
@@ -523,6 +530,10 @@ export default function App() {
 
   function openRegister() {
     setForm(EMPTY_FORM);
+    setRegisterFile(null);
+    setRegisterFileError('');
+    setRegisterProgress(null);
+    setRegisterFileKey((value) => value + 1);
     setError('');
     setRegisterOpen(true);
     writeUrl({ record: selectedId || '', create: true });
@@ -531,24 +542,64 @@ export default function App() {
   function closeRegister() {
     if (registerBusy) return;
     setRegisterOpen(false);
+    setRegisterFile(null);
+    setRegisterFileError('');
+    setRegisterProgress(null);
+    setRegisterFileKey((value) => value + 1);
     setError('');
     writeUrl({ record: selectedId || '' });
   }
 
+  function chooseRegisterFile(event) {
+    const file = event.target.files && event.target.files[0];
+    // Allow the same file to be re-selected after a validation error.
+    event.target.value = '';
+    if (!file) {
+      setRegisterFile(null);
+      setRegisterFileError('');
+      return;
+    }
+    // An invalid file stays selected (and blocks submit) until it is cleared,
+    // so an oversized file never silently degrades into a metadata-only record.
+    setRegisterFile(file);
+    setRegisterFileError(validateContentFile(file));
+  }
+
+  function clearRegisterFile() {
+    setRegisterFile(null);
+    setRegisterFileError('');
+    setRegisterFileKey((value) => value + 1);
+  }
+
   async function submit(event) {
     event.preventDefault();
+    if (registerBusy) return;
+
+    const file = registerFile;
+    if (file) {
+      const issue = validateContentFile(file);
+      if (issue) {
+        setRegisterFileError(issue);
+        return;
+      }
+    }
+
     setRegisterBusy(true);
     setError('');
     setNotice('');
+    setRegisterFileError('');
+    setRegisterProgress(null);
+
+    let created = null;
     try {
-      const created = await api.documents.create({
+      created = await api.documents.create({
         title: form.title,
         documentType: form.documentType,
         classification: form.classification,
         retentionUntil: form.retentionUntil || null
       });
       setForm(EMPTY_FORM);
-      setRegisterOpen(false);
+
       if (created?.id) {
         setSelectedId(created.id);
         setDocuments((current) => {
@@ -559,12 +610,40 @@ export default function App() {
           }
           return [created, ...current];
         });
-        writeUrl({ record: created.id });
-      } else {
-        writeUrl({ record: selectedId || '' });
       }
       setActiveTab('overview');
       setNotice('Document registered.');
+
+      // The document exists at this point. The optional evidence file is a
+      // second, contained operation: a failed upload never un-registers the
+      // metadata, and the File tab is where it can be retried.
+      if (file) {
+        if (created?.id) {
+          setRegisterProgress(0);
+          try {
+            await api.content.upload(created.id, file, {
+              onProgress: (value) => setRegisterProgress(value)
+            });
+            setRegisterFile(null);
+            setNotice(`Document registered and “${file.name}” uploaded as evidence.`);
+          } catch (cause) {
+            setError(
+              `Document ${created.documentNumber || created.id} was registered, but “${file.name}” ` +
+                `could not be uploaded: ${cause.message}`
+            );
+            setActiveTab('file');
+          }
+        } else {
+          setError(
+            `Document was registered, but “${file.name}” could not be uploaded because the API ` +
+              'did not return a document id.'
+          );
+        }
+      }
+
+      setRegisterOpen(false);
+      setRegisterFileKey((value) => value + 1);
+      writeUrl({ record: created?.id || selectedId || '' });
       try {
         await load();
       } catch (cause) {
@@ -574,6 +653,7 @@ export default function App() {
       setError(cause.message);
     } finally {
       setRegisterBusy(false);
+      setRegisterProgress(null);
     }
   }
 
@@ -1143,6 +1223,15 @@ export default function App() {
   function renderTab() {
     if (!selectedDocument) return null;
     switch (activeTab) {
+      case 'file':
+        return (
+          <DocumentContent
+            key={selectedDocument.id}
+            documentId={selectedDocument.id}
+            documentNumber={selectedDocument.documentNumber}
+            onUploaded={() => setActivityNonce((value) => value + 1)}
+          />
+        );
       case 'lifecycle':
         return renderLifecycle(selectedDocument);
       case 'retention':
@@ -1453,6 +1542,60 @@ export default function App() {
                 </select>
               </Field>
 
+              <div className="eia-field span-3">
+                <label htmlFor="register-file">File (optional)</label>
+                <input
+                  key={registerFileKey}
+                  id="register-file"
+                  type="file"
+                  onChange={chooseRegisterFile}
+                  disabled={registerBusy}
+                  aria-describedby="register-file-hint"
+                />
+                <span id="register-file-hint" className="eia-muted" style={{ fontSize: 11 }}>
+                  Stored as evidence after the document is registered. Maximum {MAX_CONTENT_LABEL}.
+                </span>
+                {registerFile && (
+                  <span className="eia-file-selected" data-testid="register-selected-file">
+                    Selected: <strong>{registerFile.name}</strong>
+                    <span className="eia-muted"> · {formatBytes(registerFile.size)}</span>
+                    <button
+                      type="button"
+                      className="eia-btn-ghost"
+                      onClick={clearRegisterFile}
+                      disabled={registerBusy}
+                      style={{ marginLeft: 8 }}
+                    >
+                      Clear file
+                    </button>
+                  </span>
+                )}
+                {registerFileError && (
+                  <span role="alert" data-testid="register-file-error">
+                    {registerFileError}
+                  </span>
+                )}
+              </div>
+
+              {registerBusy && registerProgress !== null && (
+                <div
+                  className="eia-upload-progress span-3"
+                  role="progressbar"
+                  aria-label="Register file upload progress"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={registerProgress}
+                  data-testid="register-upload-progress"
+                >
+                  <div className="eia-progress-track">
+                    <span style={{ width: `${registerProgress}%` }} />
+                  </div>
+                  <span className="eia-progress-label">
+                    Uploading {registerFile ? `“${registerFile.name}”` : 'file'}… {registerProgress}%
+                  </span>
+                </div>
+              )}
+
               <div className="eia-actions span-3" style={{ justifyContent: 'flex-end' }}>
                 <button
                   type="button"
@@ -1463,7 +1606,11 @@ export default function App() {
                   Cancel
                 </button>
                 <button type="submit" disabled={registerBusy}>
-                  {registerBusy ? 'Registering…' : 'Register document'}
+                  {registerBusy
+                    ? registerProgress !== null
+                      ? `Uploading… ${registerProgress}%`
+                      : 'Registering…'
+                    : 'Register document'}
                 </button>
               </div>
             </form>

@@ -905,3 +905,72 @@ main [role="status"] {
   font-size: 10px;
   overflow-wrap: anywhere;
 }
+
+/* Stored document content: metadata, upload, progress, and download. */
+.eia-content-empty { text-align: left; }
+.eia-content-empty > p { max-width: 760px; }
+
+main input[type="file"] { padding: 6px 8px !important; }
+main input[type="file"]::file-selector-button {
+  margin-right: 10px;
+  padding: 5px 10px;
+  border: 1px solid #b9cde0;
+  border-radius: 5px;
+  background: #fff;
+  color: var(--eia-blue);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+main input[type="file"]::file-selector-button:hover { background: #f2f7fb; }
+
+.eia-dropzone {
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px dashed #b9cde0;
+  border-radius: 7px;
+  background: #f9fbfd;
+  text-align: left;
+}
+.eia-dropzone.over {
+  border-color: var(--eia-blue);
+  background: #eef5fb;
+  box-shadow: 0 0 0 3px rgba(31, 95, 153, .08);
+}
+.eia-dropzone label { display: block; margin-bottom: 5px; }
+
+.eia-file-selected {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--eia-ink);
+  overflow-wrap: anywhere;
+}
+
+.eia-upload-progress { margin-top: 10px; min-width: 220px; }
+
+.eia-progress-track {
+  height: 7px;
+  background: #e3ebf3;
+  border-radius: 999px;
+  overflow: hidden;
+}
+.eia-progress-track > span {
+  display: block;
+  height: 100%;
+  background: var(--eia-blue);
+  border-radius: inherit;
+  transition: width .15s ease;
+}
+.eia-progress-label {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--eia-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.eia-file-meta { grid-template-columns: 130px minmax(0, 1fr); }
+.eia-content-hash { overflow-wrap: anywhere; line-height: 1.5; }
+
+.eia-field > [role="alert"] { display: block; margin-top: 2px; }

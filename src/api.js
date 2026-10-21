@@ -1,4 +1,9 @@
 import { ACTIVITY_LIMIT, aggregateEventsEndpoint } from './events.js';
+import {
+  contentFileNameHeader,
+  contentMimeType,
+  fileNameFromContentDisposition
+} from './documentContent.js';
 
 export const TENANT = '11111111-1111-7111-8111-111111111111';
 export const API_BASE = '/api/v1/documents';
@@ -11,19 +16,38 @@ export class ApiError extends Error {
   }
 }
 
-async function readError(response) {
-  try {
-    const body = await response.json();
-    if (body && body.code) {
+/** Maps the API's JSON error envelope (or a bare status) to a message. */
+function errorMessage(body, status) {
+  if (body && typeof body === 'object') {
+    if (body.code) {
       return body.message ? `${body.code}: ${body.message}` : String(body.code);
     }
-    if (body && (body.detail || body.message || body.title)) {
+    if (body.detail || body.message || body.title) {
       return body.detail || body.message || body.title;
     }
+  }
+  return `Request failed with status ${status}`;
+}
+
+function parseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+async function readError(response) {
+  try {
+    return errorMessage(await response.json(), response.status);
   } catch (ignored) {
     // The API returns a JSON error envelope; fall back to the status otherwise.
+    return `Request failed with status ${response.status}`;
   }
-  return `Request failed with status ${response.status}`;
+}
+
+function contentPath(documentId, suffix = '') {
+  return `${API_BASE}/${encodeURIComponent(documentId)}/content${suffix}`;
 }
 
 /**
@@ -82,6 +106,78 @@ export const api = {
         `${API_BASE}/${encodeURIComponent(documentId)}/links/${encodeURIComponent(linkId)}`,
         { method: 'DELETE' }
       )
+  },
+  content: {
+    /**
+     * Stored-content metadata for one document. A 404 means the document is
+     * registered but no evidence file has been stored yet; that is an empty
+     * state, not an error.
+     */
+    metadata: async (documentId) => {
+      try {
+        return await request(contentPath(documentId, '/metadata'));
+      } catch (cause) {
+        if (cause instanceof ApiError && cause.status === 404) return null;
+        // A 200 with an empty body is still "unknown metadata", not a crash.
+        if (cause instanceof SyntaxError) return null;
+        throw cause;
+      }
+    },
+    /**
+     * Uploads the raw file bytes. The file name and media type travel in
+     * headers because the body is the file itself, never a JSON envelope.
+     * XMLHttpRequest is used so the caller can show byte-level progress.
+     */
+    upload: (documentId, file, { onProgress } = {}) =>
+      new Promise((resolve, reject) => {
+        if (typeof XMLHttpRequest === 'undefined') {
+          reject(new ApiError('This environment cannot upload files.', 0));
+          return;
+        }
+
+        const xhr = new XMLHttpRequest();
+        xhr.open('PUT', contentPath(documentId));
+        xhr.setRequestHeader('X-EIA-Tenant', TENANT);
+        xhr.setRequestHeader('Content-Type', contentMimeType(file));
+        xhr.setRequestHeader('X-File-Name', contentFileNameHeader(file.name));
+
+        if (xhr.upload && typeof onProgress === 'function') {
+          xhr.upload.onprogress = (event) => {
+            const total = event.total || (file && file.size) || 0;
+            if (total > 0) {
+              onProgress(Math.min(100, Math.round((event.loaded / total) * 100)));
+            }
+          };
+        }
+
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            if (typeof onProgress === 'function') onProgress(100);
+            resolve(xhr.status === 204 ? null : parseJson(xhr.responseText));
+            return;
+          }
+          reject(new ApiError(errorMessage(parseJson(xhr.responseText), xhr.status), xhr.status));
+        };
+        xhr.onerror = () =>
+          reject(new ApiError('The file could not be uploaded because the network request failed.', 0));
+        xhr.onabort = () => reject(new ApiError('The file upload was cancelled.', 0));
+
+        xhr.send(file);
+      }),
+    /** Reads the stored bytes as a blob for an authorized client download. */
+    download: async (documentId) => {
+      const response = await fetch(contentPath(documentId), {
+        cache: 'no-store',
+        headers: { 'X-EIA-Tenant': TENANT }
+      });
+      if (!response.ok) {
+        throw new ApiError(await readError(response), response.status);
+      }
+      return {
+        blob: await response.blob(),
+        fileName: fileNameFromContentDisposition(response.headers.get('Content-Disposition'))
+      };
+    }
   },
   events: {
     /**
