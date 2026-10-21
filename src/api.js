@@ -50,6 +50,21 @@ function contentPath(documentId, suffix = '') {
   return `${API_BASE}/${encodeURIComponent(documentId)}/content${suffix}`;
 }
 
+/** Reads an authorized binary representation and its suggested file name. */
+async function downloadBlob(path) {
+  const response = await fetch(path, {
+    cache: 'no-store',
+    headers: { 'X-EIA-Tenant': TENANT }
+  });
+  if (!response.ok) {
+    throw new ApiError(await readError(response), response.status);
+  }
+  return {
+    blob: await response.blob(),
+    fileName: fileNameFromContentDisposition(response.headers.get('Content-Disposition'))
+  };
+}
+
 /**
  * Transport for the public Document API. The tenant is never part of a body;
  * it always travels in X-EIA-Tenant. A 204 response has no body.
@@ -165,18 +180,26 @@ export const api = {
         xhr.send(file);
       }),
     /** Reads the stored bytes as a blob for an authorized client download. */
-    download: async (documentId) => {
-      const response = await fetch(contentPath(documentId), {
-        cache: 'no-store',
-        headers: { 'X-EIA-Tenant': TENANT }
-      });
-      if (!response.ok) {
-        throw new ApiError(await readError(response), response.status);
-      }
-      return {
-        blob: await response.blob(),
-        fileName: fileNameFromContentDisposition(response.headers.get('Content-Disposition'))
-      };
+    download: (documentId) => downloadBlob(contentPath(documentId)),
+    /**
+     * Immutable content revisions, newest first. The API returns a plain array
+     * of revision metadata; an older deployment without the route, or a
+     * document whose content predates revision history, reads as no history
+     * rather than a failure.
+     */
+    versions: {
+      list: async (documentId) => {
+        try {
+          return await request(contentPath(documentId, '/versions'));
+        } catch (cause) {
+          if (cause instanceof ApiError && cause.status === 404) return [];
+          if (cause instanceof SyntaxError) return [];
+          throw cause;
+        }
+      },
+      /** Reads the bytes of one retained revision as a blob. */
+      download: (documentId, version) =>
+        downloadBlob(contentPath(documentId, `/versions/${encodeURIComponent(version)}`))
     }
   },
   events: {

@@ -77,6 +77,16 @@ function firstNumber(...values) {
   return null;
 }
 
+/** Content revisions are positive integers; anything else is not a version. */
+function firstVersion(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined || value === '') continue;
+    const parsed = Number(value);
+    if (Number.isInteger(parsed) && parsed > 0) return parsed;
+  }
+  return null;
+}
+
 function firstValue(...values) {
   for (const value of values) {
     if (value !== null && value !== undefined && value !== '') return value;
@@ -148,6 +158,16 @@ export function normalizeContentMetadata(body) {
     record.stored_at,
     record.createdAt
   );
+  // The current file is a revision of the document's content. Older backends
+  // did not return a revision, so the version history can still supply it.
+  const currentVersion = firstVersion(
+    record.currentVersion,
+    record.current_version,
+    record.contentVersion,
+    record.content_version,
+    record.version,
+    record.revision
+  );
 
   if (!fileName && sizeBytes === null && !sha256 && !uploadedAt) return null;
   // A zero-valued projection ("no file yet") is an empty state, not content.
@@ -158,8 +178,139 @@ export function normalizeContentMetadata(body) {
     contentType,
     sizeBytes,
     sha256,
-    uploadedAt
+    uploadedAt,
+    currentVersion
   };
+}
+
+/**
+ * One stored revision of the file. The Document API lists revisions newest
+ * first as `{ documentId, version, fileName, contentType, sizeBytes, sha256,
+ * uploadedAt }`; the aliases keep the view tolerant of a richer or older
+ * projection without changing how the table renders.
+ */
+function normalizeContentVersion(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return null;
+  const version = firstVersion(
+    record.version,
+    record.currentVersion,
+    record.current_version,
+    record.contentVersion,
+    record.content_version,
+    record.revision,
+    record.versionNumber,
+    record.version_number
+  );
+  if (version === null) return null;
+
+  return {
+    version,
+    fileName: firstText(
+      record.fileName,
+      record.filename,
+      record.file_name,
+      record.originalFileName,
+      record.originalFilename,
+      record.name
+    ),
+    contentType: firstText(
+      record.contentType,
+      record.content_type,
+      record.mimeType,
+      record.mime_type,
+      record.mediaType,
+      record.type
+    ),
+    sizeBytes: firstNumber(
+      record.sizeBytes,
+      record.size_bytes,
+      record.contentLength,
+      record.content_length,
+      record.byteSize,
+      record.byte_size,
+      record.size
+    ),
+    sha256: normalizeSha256(firstValue(
+      record.sha256,
+      record.sha_256,
+      record.contentSha256,
+      record.content_sha256,
+      record.checksumSha256,
+      record.checksum_sha256,
+      record.checksum,
+      record.hash
+    )),
+    uploadedAt: firstText(
+      record.uploadedAt,
+      record.uploaded_at,
+      record.storedAt,
+      record.stored_at,
+      record.createdAt,
+      record.created_at
+    )
+  };
+}
+
+/**
+ * Folds the version-list response into the rows the table renders. The API
+ * returns a plain array; envelope and object-keyed forms are accepted so an
+ * older or paginated projection still renders. Entries are newest first.
+ */
+export function normalizeContentVersions(body) {
+  let source = [];
+  let currentVersion = null;
+
+  if (Array.isArray(body)) {
+    source = body;
+  } else if (body && typeof body === 'object') {
+    currentVersion = firstVersion(
+      body.currentVersion,
+      body.current_version,
+      body.latestVersion,
+      body.latest_version,
+      body.current && typeof body.current === 'object' ? body.current.version : null
+    );
+    for (const key of ['versions', 'items', 'contentVersions', 'content_versions', 'history', 'records', 'data']) {
+      if (Array.isArray(body[key])) {
+        source = body[key];
+        break;
+      }
+    }
+  }
+
+  const versions = [];
+  const seen = new Set();
+  for (const entry of source) {
+    const normalized = normalizeContentVersion(entry);
+    if (!normalized || seen.has(normalized.version)) continue;
+    seen.add(normalized.version);
+    versions.push(normalized);
+  }
+  versions.sort((left, right) => right.version - left.version);
+
+  return { versions, currentVersion };
+}
+
+/**
+ * The current revision shown in the metadata. The API's `currentVersion` wins;
+ * when an older API omits it, the newest listed revision is the current one.
+ * Existing content always has at least version 1, including files stored
+ * before revisions existed and backfilled as v1.
+ */
+export function resolveCurrentContentVersion(metadata, versions = [], declaredCurrent = null, options = {}) {
+  const { historyAvailable = true } = options;
+  if (metadata && metadata.currentVersion) return metadata.currentVersion;
+  if (declaredCurrent) return declaredCurrent;
+  if (versions.length > 0) return versions[0].version;
+  if (metadata && historyAvailable) return 1;
+  return null;
+}
+
+/** The first twelve hex characters of a SHA-256, for a compact table cell. */
+export function shortSha256(value, length = 12) {
+  const text = normalizeSha256(value);
+  if (!text) return '—';
+  return text.length > length ? `${text.slice(0, length)}…` : text;
 }
 
 /** Reads the file name from a Content-Disposition response header. */

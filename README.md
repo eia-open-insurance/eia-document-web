@@ -43,19 +43,29 @@ attached by the Document service:
   with `Content-Type` and `X-File-Name` describing the file (never JSON).
 - `GET /api/v1/documents/{documentId}/content` returns the authorized bytes.
 - `GET /api/v1/documents/{documentId}/content/metadata` returns the file name,
-  media type, size, SHA-256, and upload timestamp; a 404 means no file is
-  stored.
+  media type, size, SHA-256, upload timestamp, and `currentVersion`; a 404
+  means no file is stored.
+- `GET /api/v1/documents/{documentId}/content/versions` lists immutable
+  revision metadata newest first.
+- `GET /api/v1/documents/{documentId}/content/versions/{version}` returns the
+  bytes of one retained revision with the same attachment headers as the
+  current-file download.
 
 The remote surfaces this in the **File** tab. With content, it renders the
-metadata and downloads the bytes as a blob through an object URL. Without
+current file metadata including `currentVersion` and a version-history table
+(version, file name, type, size, short SHA-256, uploaded time, and a download
+action per row). Uploading a new version replaces the current file, adds a
+retained revision, and refreshes both the metadata and history. Without
 content, it shows "No file stored" and offers an upload input and drag/drop.
 Files are validated client-side at 10 MiB, upload progress is shown through
 `XMLHttpRequest`, and read/upload/download failures stay contained in the tab.
 The register-document dialog accepts an optional file and uploads it after the
 metadata is created; a failed upload leaves the registered document intact and
 switches to the File tab so it can be retried. `tests/content.spec.js` covers
-the upload headers and raw body, metadata rendering, download, empty state,
-oversized rejection, and upload/metadata errors.
+the upload headers and raw body, metadata and current-version rendering,
+history ordering and columns, version blob download, upload refresh, empty
+history, version/read errors, metadata rendering, current download, empty
+state, and oversized rejection.
 
 ## Verification
 

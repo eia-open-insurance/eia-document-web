@@ -4,13 +4,18 @@ import {
   MAX_CONTENT_LABEL,
   formatBytes,
   normalizeContentMetadata,
+  normalizeContentVersions,
+  resolveCurrentContentVersion,
   saveBlob,
+  shortSha256,
   validateContentFile
 } from './documentContent.js';
 
 const EMPTY_CONTENT = { loading: true, metadata: null, error: '' };
+const EMPTY_VERSION_HISTORY = { loading: true, versions: [], currentVersion: null, error: '' };
 const EMPTY_UPLOAD = { busy: false, progress: null, error: '', notice: '' };
 const EMPTY_DOWNLOAD = { busy: false, error: '', notice: '' };
+const EMPTY_VERSION_DOWNLOAD = { busy: null, error: '', notice: '' };
 
 function formatUploadedAt(value) {
   if (!value) return '—';
@@ -49,16 +54,21 @@ function ProgressBar({ label, value }) {
 
 /**
  * The stored evidence file attached to one document. The document metadata
- * stays the source of truth; this panel only reads, uploads, and downloads the
- * content the Document service stores beside that metadata.
+ * stays the source of truth; this panel reads, uploads, and downloads the
+ * content the Document service stores beside that metadata. Every upload is
+ * retained as an immutable version, and the panel lets a caller inspect and
+ * download any revision without changing the current file.
  */
 export default function DocumentContent({ documentId, documentNumber, onUploaded }) {
   const [content, setContent] = useState(EMPTY_CONTENT);
+  const [versionHistory, setVersionHistory] = useState(EMPTY_VERSION_HISTORY);
   const [reload, setReload] = useState(0);
   const [pendingFile, setPendingFile] = useState(null);
   const [fileError, setFileError] = useState('');
   const [upload, setUpload] = useState(EMPTY_UPLOAD);
   const [download, setDownload] = useState(EMPTY_DOWNLOAD);
+  const [versionDownload, setVersionDownload] = useState(EMPTY_VERSION_DOWNLOAD);
+  const [versionUploadOpen, setVersionUploadOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
   const mountedRef = useRef(true);
 
@@ -72,6 +82,8 @@ export default function DocumentContent({ documentId, documentNumber, onUploaded
   useEffect(() => {
     let alive = true;
     setContent((current) => ({ ...current, loading: true, error: '' }));
+    setVersionHistory((current) => ({ ...current, loading: true, error: '' }));
+
     api.content
       .metadata(documentId)
       .then((body) => {
@@ -82,10 +94,36 @@ export default function DocumentContent({ documentId, documentNumber, onUploaded
         if (!alive) return;
         setContent((current) => ({ loading: false, metadata: current.metadata, error: cause.message }));
       });
+
+    api.content.versions
+      .list(documentId)
+      .then((body) => {
+        if (!alive) return;
+        const normalized = normalizeContentVersions(body);
+        setVersionHistory({
+          loading: false,
+          versions: normalized.versions,
+          currentVersion: normalized.currentVersion,
+          error: ''
+        });
+      })
+      .catch((cause) => {
+        if (!alive) return;
+        setVersionHistory((current) => ({ ...current, loading: false, error: cause.message }));
+      });
+
     return () => {
       alive = false;
     };
   }, [documentId, reload]);
+
+  const historyAvailable = !versionHistory.loading && !versionHistory.error;
+  const currentVersion = resolveCurrentContentVersion(
+    content.metadata,
+    versionHistory.versions,
+    versionHistory.currentVersion,
+    { historyAvailable }
+  );
 
   function chooseFile(file) {
     if (!file) return;
@@ -133,14 +171,23 @@ export default function DocumentContent({ documentId, documentNumber, onUploaded
     setFileError('');
     setUpload({ busy: true, progress: 0, error: '', notice: '' });
     try {
-      await api.content.upload(documentId, file, {
+      const uploaded = await api.content.upload(documentId, file, {
         onProgress: (progress) => {
           if (!mountedRef.current) return;
           setUpload((current) => (current.busy ? { ...current, progress } : current));
         }
       });
       if (!mountedRef.current) return;
+      // The upload response is the new current metadata, so the version shown
+      // beside the file updates before the history read completes. A 204 or
+      // older response shape falls back to the reload below.
+      const uploadedMetadata = normalizeContentMetadata(uploaded);
+      if (uploadedMetadata) {
+        setContent({ loading: false, metadata: uploadedMetadata, error: '' });
+      }
       setPendingFile(null);
+      setVersionUploadOpen(false);
+      setVersionDownload(EMPTY_VERSION_DOWNLOAD);
       setUpload({
         busy: false,
         progress: 100,
@@ -173,6 +220,42 @@ export default function DocumentContent({ documentId, documentNumber, onUploaded
     }
   }
 
+  async function downloadVersion(version) {
+    if (!version || versionDownload.busy !== null) return;
+    const number = version.version;
+    setVersionDownload({ busy: number, error: '', notice: '' });
+    try {
+      const stored = await api.content.versions.download(documentId, number);
+      if (!mountedRef.current) return;
+      const fileName =
+        version.fileName || stored.fileName || `${documentNumber || 'document'}-v${number}.bin`;
+      saveBlob(stored.blob, fileName);
+      setVersionDownload({
+        busy: null,
+        error: '',
+        notice: `Version ${number} (${fileName}) downloaded.`
+      });
+    } catch (cause) {
+      if (!mountedRef.current) return;
+      setVersionDownload({
+        busy: null,
+        error: `Version ${number} could not be downloaded: ${cause.message}`,
+        notice: ''
+      });
+    }
+  }
+
+  function toggleVersionUpload() {
+    if (upload.busy) return;
+    const next = !versionUploadOpen;
+    setVersionUploadOpen(next);
+    if (!next) {
+      setPendingFile(null);
+      setFileError('');
+      setUpload(EMPTY_UPLOAD);
+    }
+  }
+
   function renderProgress() {
     if (!upload.busy) return null;
     return <ProgressBar label={upload.progress === null ? 'Uploading' : 'Uploading file'} value={upload.progress} />;
@@ -200,6 +283,48 @@ export default function DocumentContent({ documentId, documentNumber, onUploaded
     );
   }
 
+  function renderUploader({ newVersion = false } = {}) {
+    const inputId = newVersion ? 'content-version-file-input' : 'content-file-input';
+    const hintId = newVersion ? 'content-version-file-hint' : 'content-file-hint';
+    return (
+      <div
+        className={`eia-dropzone ${dragging ? 'over' : ''}`.trim()}
+        data-testid={newVersion ? 'version-file-dropzone' : 'file-dropzone'}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
+      >
+        <label htmlFor={inputId}>{newVersion ? 'New version file' : 'File to upload'}</label>
+        <input
+          id={inputId}
+          type="file"
+          onChange={onInputChange}
+          disabled={upload.busy}
+          aria-describedby={hintId}
+        />
+        <p id={hintId} className="eia-muted" style={{ margin: '6px 0 0' }}>
+          Drag a file here, or choose one. Maximum {MAX_CONTENT_LABEL}.
+        </p>
+        {pendingFile && (
+          <p
+            className="eia-file-selected"
+            data-testid={newVersion ? 'version-selected-file' : 'selected-file'}
+            style={{ margin: '8px 0 0' }}
+          >
+            Selected: <strong>{pendingFile.name}</strong>
+            <span className="eia-muted"> · {formatBytes(pendingFile.size)}</span>
+          </p>
+        )}
+        <div className="eia-actions" style={{ justifyContent: 'center', marginTop: 10 }}>
+          <button type="button" onClick={uploadSelected} disabled={!pendingFile || upload.busy}>
+            {upload.busy ? 'Uploading…' : newVersion ? 'Upload new version' : 'Upload file'}
+          </button>
+        </div>
+        {renderProgress()}
+      </div>
+    );
+  }
+
   function renderNoContent() {
     return (
       <div className="eia-card eia-content-empty" data-testid="no-content">
@@ -212,37 +337,7 @@ export default function DocumentContent({ documentId, documentNumber, onUploaded
           document metadata stays authoritative.
         </p>
 
-        <div
-          className={`eia-dropzone ${dragging ? 'over' : ''}`.trim()}
-          data-testid="file-dropzone"
-          onDragOver={onDragOver}
-          onDragLeave={onDragLeave}
-          onDrop={onDrop}
-        >
-          <label htmlFor="content-file-input">File to upload</label>
-          <input
-            id="content-file-input"
-            type="file"
-            onChange={onInputChange}
-            disabled={upload.busy}
-            aria-describedby="content-file-hint"
-          />
-          <p id="content-file-hint" className="eia-muted" style={{ margin: '6px 0 0' }}>
-            Drag a file here, or choose one. Maximum {MAX_CONTENT_LABEL}.
-          </p>
-          {pendingFile && (
-            <p className="eia-file-selected" data-testid="selected-file" style={{ margin: '8px 0 0' }}>
-              Selected: <strong>{pendingFile.name}</strong>
-              <span className="eia-muted"> · {formatBytes(pendingFile.size)}</span>
-            </p>
-          )}
-          <div className="eia-actions" style={{ justifyContent: 'center', marginTop: 10 }}>
-            <button type="button" onClick={uploadSelected} disabled={!pendingFile || upload.busy}>
-              {upload.busy ? 'Uploading…' : 'Upload file'}
-            </button>
-          </div>
-          {renderProgress()}
-        </div>
+        {renderUploader()}
       </div>
     );
   }
@@ -253,12 +348,16 @@ export default function DocumentContent({ documentId, documentNumber, onUploaded
       <section className="eia-card" aria-label="Stored file" data-testid="file-metadata">
         <div className="eia-section-title" style={{ margin: '0 0 10px' }}>
           <h3 style={{ margin: 0 }}>Stored file</h3>
-          <span className="eia-muted">Immutable content</span>
+          <span className="eia-muted">Current file</span>
         </div>
 
         <dl className="eia-kv eia-file-meta">
           <dt>File name</dt>
           <dd data-testid="content-file-name">{metadata.fileName || '—'}</dd>
+          <dt>Current version</dt>
+          <dd data-testid="content-current-version">
+            {currentVersion ? `v${currentVersion}` : '—'}
+          </dd>
           <dt>Type</dt>
           <dd data-testid="content-file-type">{metadata.contentType || '—'}</dd>
           <dt>Size</dt>
@@ -290,7 +389,27 @@ export default function DocumentContent({ documentId, documentNumber, onUploaded
           >
             {download.busy ? 'Downloading…' : 'Download'}
           </button>
+          <button
+            type="button"
+            className="eia-btn-secondary"
+            onClick={toggleVersionUpload}
+            disabled={upload.busy}
+            aria-expanded={versionUploadOpen}
+            data-testid="toggle-upload-version"
+          >
+            {versionUploadOpen ? 'Cancel new version' : 'Upload new version'}
+          </button>
         </div>
+
+        {versionUploadOpen && (
+          <>
+            <p className="eia-muted" style={{ margin: '10px 0 0' }}>
+              Uploading replaces the current file and adds a new version. Earlier versions stay
+              downloadable from the history below.
+            </p>
+            {renderUploader({ newVersion: true })}
+          </>
+        )}
 
         {download.error && (
           <p role="alert" data-testid="download-error" style={{ margin: '10px 0 0' }}>
@@ -300,6 +419,152 @@ export default function DocumentContent({ documentId, documentNumber, onUploaded
         {download.notice && (
           <p role="status" data-testid="download-notice" style={{ margin: '10px 0 0' }}>
             {download.notice}
+          </p>
+        )}
+      </section>
+    );
+  }
+
+  function renderVersionHistory() {
+    const { loading, error, versions } = versionHistory;
+    return (
+      <section
+        className="eia-card"
+        aria-label="Version history"
+        data-testid="version-history"
+        style={{ marginTop: 14 }}
+      >
+        <div className="eia-section-title" style={{ margin: '0 0 10px' }}>
+          <h3 style={{ margin: 0 }}>Version history</h3>
+          <span className="eia-muted" data-testid="version-count">
+            {loading
+              ? '…'
+              : error
+                ? 'Unavailable'
+                : `${versions.length} version${versions.length === 1 ? '' : 's'}`}
+          </span>
+        </div>
+        <p className="eia-muted" style={{ margin: '0 0 10px' }}>
+          Every upload is retained as an immutable revision. Downloading an older version never
+          changes the current file.
+        </p>
+
+        {loading && (
+          <p className="eia-muted" role="status" data-testid="version-history-loading">
+            Loading version history…
+          </p>
+        )}
+
+        {!loading && error && (
+          <div className="eia-empty" data-testid="version-history-error">
+            <p role="alert" style={{ marginTop: 0 }}>
+              {error}
+            </p>
+            <button type="button" onClick={() => setReload((value) => value + 1)}>
+              Retry
+            </button>
+          </div>
+        )}
+
+        {!loading && !error && versions.length === 0 && (
+          <div className="eia-empty" data-testid="version-history-empty">
+            <p style={{ marginTop: 0 }}>
+              <strong>No version history yet</strong>
+            </p>
+            <p style={{ marginBottom: 0 }}>
+              {currentVersion
+                ? `The current file is version ${currentVersion}. `
+                : 'The current file is not versioned yet. '}
+              Files stored before version history existed appear as version 1; each new upload adds
+              an entry here.
+            </p>
+          </div>
+        )}
+
+        {!loading && !error && versions.length > 0 && (
+          <div className="eia-table-wrap">
+            <table
+              className="eia-table"
+              aria-label="File version history"
+              data-testid="version-history-table"
+            >
+              <thead>
+                <tr>
+                  <th>Version</th>
+                  <th>File name</th>
+                  <th>Type</th>
+                  <th>Size</th>
+                  <th>SHA-256</th>
+                  <th>Uploaded</th>
+                  <th>Download</th>
+                </tr>
+              </thead>
+              <tbody>
+                {versions.map((version) => {
+                  const isCurrent = version.version === currentVersion;
+                  return (
+                    <tr
+                      key={version.version}
+                      data-testid="version-row"
+                      data-current={isCurrent ? 'true' : undefined}
+                    >
+                      <td>
+                        <span className="eia-mono" data-testid="version-number">
+                          {`v${version.version}`}
+                        </span>
+                        {isCurrent && (
+                          <span
+                            className="eia-pill blue"
+                            style={{ marginLeft: 6 }}
+                            data-testid="version-current-badge"
+                          >
+                            Current
+                          </span>
+                        )}
+                      </td>
+                      <td data-testid="version-file-name">{version.fileName || '—'}</td>
+                      <td data-testid="version-file-type">{version.contentType || '—'}</td>
+                      <td data-testid="version-file-size">{formatBytes(version.sizeBytes)}</td>
+                      <td
+                        className="eia-mono"
+                        data-testid="version-sha256"
+                        title={version.sha256 || undefined}
+                      >
+                        {shortSha256(version.sha256)}
+                      </td>
+                      <td data-testid="version-uploaded">
+                        <time dateTime={version.uploadedAt || undefined}>
+                          {formatUploadedAt(version.uploadedAt)}
+                        </time>
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          className="eia-btn-secondary"
+                          onClick={() => downloadVersion(version)}
+                          disabled={versionDownload.busy !== null}
+                          aria-label={`Download version ${version.version}`}
+                          data-testid="download-version"
+                        >
+                          {versionDownload.busy === version.version ? 'Downloading…' : 'Download'}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {versionDownload.error && (
+          <p role="alert" data-testid="version-download-error" style={{ margin: '10px 0 0' }}>
+            {versionDownload.error}
+          </p>
+        )}
+        {versionDownload.notice && (
+          <p role="status" data-testid="version-download-notice" style={{ margin: '10px 0 0' }}>
+            {versionDownload.notice}
           </p>
         )}
       </section>
@@ -318,7 +583,8 @@ export default function DocumentContent({ documentId, documentNumber, onUploaded
         <p>
           The stored file is evidence. Document metadata — number, type, classification, retention,
           and lifecycle — remains the source of truth; uploading or downloading a file never changes
-          the business facts the document evidences or the records it is linked to.
+          the business facts the document evidences or the records it is linked to. Each upload is
+          retained as a version so an earlier file can be produced without altering the record.
         </p>
       </section>
 
@@ -341,6 +607,7 @@ export default function DocumentContent({ documentId, documentNumber, onUploaded
         )}
 
         {!content.error && content.metadata && renderMetadata(content.metadata)}
+        {!content.error && content.metadata && renderVersionHistory()}
         {!content.error && !content.metadata && !content.loading && renderNoContent()}
         {renderUploadErrors()}
       </div>

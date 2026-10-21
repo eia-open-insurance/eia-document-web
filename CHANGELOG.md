@@ -25,6 +25,17 @@ The format is based on Keep a Changelog and the project uses Semantic Versioning
   A 503 from the event service never blocks the document record. Playwright covers the
   aggregate path/limit/tenant header, newest-first rendering, the empty and 503 states,
   payload facts, and selection refetch.
+- Document content version history: the **File** tab shows `currentVersion`
+  from `GET /api/v1/documents/{id}/content/metadata` and a newest-first
+  revision table (version, file name, type, size, short SHA-256, uploaded time,
+  and Download). History reads `GET /api/v1/documents/{id}/content/versions`;
+  each Download fetches
+  `GET /api/v1/documents/{id}/content/versions/{version}` as an authorized blob
+  without changing the current file. Uploads still append through the current
+  content route and refresh both the metadata and history. An empty list has
+  its own state, and history read/download failures stay inside the card.
+  Playwright covers the current version, table order and columns, version
+  download, upload refresh, empty history, and read/download errors.
 - Document content upload/download: the **File** tab reads
   `GET /api/v1/documents/{id}/content/metadata` and shows the stored file name, media type,
   size, SHA-256, and upload time, or the "No file stored" empty state with an upload input and

@@ -29,34 +29,78 @@ const FILE_METADATA = {
   uploadedAt: '2026-10-20T15:04:00Z'
 };
 
+const FILE_VERSIONS = [
+  {
+    documentId: DOCUMENT_ID,
+    version: 3,
+    fileName: 'policy-schedule.pdf',
+    contentType: 'application/pdf',
+    sizeBytes: 1843200,
+    sha256: FILE_METADATA.sha256,
+    uploadedAt: '2026-10-20T15:04:00Z'
+  },
+  {
+    documentId: DOCUMENT_ID,
+    version: 2,
+    fileName: 'policy-schedule-v2.pdf',
+    contentType: 'application/pdf',
+    sizeBytes: 1843200,
+    sha256: 'c'.repeat(64),
+    uploadedAt: '2026-10-19T14:02:00Z'
+  },
+  {
+    documentId: DOCUMENT_ID,
+    version: 1,
+    fileName: 'policy-schedule-v1.pdf',
+    contentType: 'application/pdf',
+    sizeBytes: 1843000,
+    sha256: 'd'.repeat(64),
+    uploadedAt: '2026-10-18T13:01:00Z'
+  }
+];
+
 /**
  * Stateful mock for the Document metadata and content routes. Content is kept
  * per document so a file can be uploaded during registration and then read
- * back from the File tab. Raw byte bodies are captured for assertions.
+ * back from the File tab. Raw byte bodies are captured for assertions. Version
+ * history follows the Document API: a plain newest-first array of revision
+ * metadata, with each revision downloaded from its own route.
  */
 async function installContentMock(page, options = {}) {
   const {
     contents = {},
     contentBytes = {},
+    versions = {},
+    versionBytes = {},
     metadataStatus = 0,
     metadataError = null,
     uploadStatus = 201,
     uploadError = null,
     contentStatus = 200,
-    uploadDelay = 0
+    uploadDelay = 0,
+    versionsStatus = 0,
+    versionsError = null,
+    versionDownloadStatus = 0,
+    versionDownloadError = null
   } = options;
 
   const state = {
     documents: [{ ...DOCUMENT }],
     contents: new Map(Object.entries(contents)),
     bytes: new Map(Object.entries(contentBytes)),
+    versions: new Map(Object.entries(versions)),
+    versionBytes: new Map(Object.entries(versionBytes)),
     requests: [],
     metadataStatus,
     metadataError,
     uploadStatus,
     uploadError,
     contentStatus,
-    uploadDelay
+    uploadDelay,
+    versionsStatus,
+    versionsError,
+    versionDownloadStatus,
+    versionDownloadError
   };
 
   await page.route('**/api/v1/documents**', async (route) => {
@@ -127,6 +171,57 @@ async function installContentMock(page, options = {}) {
           });
     }
 
+    const versionListMatch = path.match(/^\/api\/v1\/documents\/([^/]+)\/content\/versions$/);
+    if (versionListMatch && method === 'GET') {
+      if (state.versionsStatus) {
+        return fulfillJson(
+          state.versionsStatus,
+          state.versionsError || {
+            code: 'CONTENT_VERSIONS_UNAVAILABLE',
+            message: 'Version history is temporarily unavailable.'
+          }
+        );
+      }
+      return fulfillJson(200, state.versions.get(versionListMatch[1]) || []);
+    }
+
+    const versionDownloadMatch = path.match(
+      /^\/api\/v1\/documents\/([^/]+)\/content\/versions\/([^/]+)$/
+    );
+    if (versionDownloadMatch && method === 'GET') {
+      if (state.versionDownloadStatus >= 400) {
+        return fulfillJson(
+          state.versionDownloadStatus,
+          state.versionDownloadError || {
+            code: 'CONTENT_VERSION_READ_FAILED',
+            message: 'The stored version could not be read.'
+          }
+        );
+      }
+      const versionsForDocument = state.versions.get(versionDownloadMatch[1]) || [];
+      const entry = versionsForDocument.find(
+        (version) => String(version.version) === versionDownloadMatch[2]
+      );
+      const bytesByVersion = state.versionBytes.get(versionDownloadMatch[1]) || {};
+      const buffer = bytesByVersion[versionDownloadMatch[2]];
+      if (!entry && !buffer) {
+        return fulfillJson(404, {
+          code: 'CONTENT_VERSION_NOT_FOUND',
+          message: `Version ${versionDownloadMatch[2]} is not stored for this document.`
+        });
+      }
+      return route.fulfill({
+        status: 200,
+        contentType: (entry && entry.contentType) || 'application/octet-stream',
+        headers: {
+          'Content-Disposition': `attachment; filename="${(entry && entry.fileName) || `version-${versionDownloadMatch[2]}.bin`}"`,
+          'X-Content-SHA256': (entry && entry.sha256) || '',
+          'X-Content-Version': versionDownloadMatch[2]
+        },
+        body: buffer || Buffer.from('stored version content')
+      });
+    }
+
     const contentMatch = path.match(/^\/api\/v1\/documents\/([^/]+)\/content$/);
     if (contentMatch && method === 'PUT') {
       if (state.uploadDelay) {
@@ -148,16 +243,40 @@ async function installContentMock(page, options = {}) {
       } catch {
         fileName = headerName;
       }
+      const existing = state.contents.get(contentMatch[1]);
+      const priorVersions = state.versions.get(contentMatch[1]) || [];
+      const priorVersion = Math.max(
+        Number(existing && existing.currentVersion) || 0,
+        ...priorVersions.map((version) => Number(version.version) || 0),
+        0
+      );
+      const version = priorVersion + 1;
       const metadata = {
         documentId: contentMatch[1],
         fileName,
         contentType: request.headers()['content-type'] || 'application/octet-stream',
         sizeBytes: recorded.body.length,
         sha256: 'b'.repeat(64),
-        uploadedAt: '2026-10-20T16:00:00Z'
+        uploadedAt: '2026-10-20T16:00:00Z',
+        currentVersion: version
       };
       state.contents.set(contentMatch[1], metadata);
       state.bytes.set(contentMatch[1], recorded.body);
+      state.versions.set(contentMatch[1], [
+        {
+          documentId: contentMatch[1],
+          version,
+          fileName,
+          contentType: metadata.contentType,
+          sizeBytes: metadata.sizeBytes,
+          sha256: metadata.sha256,
+          uploadedAt: metadata.uploadedAt
+        },
+        ...priorVersions
+      ]);
+      const versionBytesById = state.versionBytes.get(contentMatch[1]) || {};
+      versionBytesById[String(version)] = recorded.body;
+      state.versionBytes.set(contentMatch[1], versionBytesById);
       return fulfillJson(201, metadata);
     }
 
@@ -482,4 +601,226 @@ test('rejects an oversized file in the register modal before creating the docume
   await dialog.getByRole('button', { name: 'Clear file' }).click();
   await expect(dialog.getByTestId('register-selected-file')).toHaveCount(0);
   await expect(dialog.getByTestId('register-file-error')).toHaveCount(0);
+});
+
+test('shows the current version and the retained file versions', async ({ page }) => {
+  const current = Buffer.from('%PDF-1.7 current policy schedule\n');
+  const state = await installContentMock(page, {
+    contents: { [DOCUMENT_ID]: { ...FILE_METADATA, currentVersion: 3 } },
+    contentBytes: { [DOCUMENT_ID]: current },
+    versions: { [DOCUMENT_ID]: FILE_VERSIONS },
+    versionBytes: { [DOCUMENT_ID]: { 3: current } }
+  });
+
+  await page.goto('/');
+  await openFileTab(page);
+
+  await expect(page.getByTestId('content-current-version')).toHaveText('v3');
+  await expect(page.getByTestId('version-count')).toHaveText('3 versions');
+  await expect(page.getByTestId('version-history-table')).toBeVisible();
+  await expect(page.getByTestId('version-row')).toHaveCount(3);
+  await expect(
+    page.getByTestId('version-history-table').getByRole('columnheader')
+  ).toHaveText([
+    'Version',
+    'File name',
+    'Type',
+    'Size',
+    'SHA-256',
+    'Uploaded',
+    'Download'
+  ]);
+  await expect(page.getByTestId('version-number')).toHaveText(['v3', 'v2', 'v1']);
+
+  const currentRow = page.getByTestId('version-row').first();
+  await expect(currentRow.getByTestId('version-number')).toHaveText('v3');
+  await expect(currentRow.getByTestId('version-current-badge')).toBeVisible();
+  await expect(currentRow.getByTestId('version-file-name')).toHaveText('policy-schedule.pdf');
+  await expect(currentRow.getByTestId('version-file-type')).toHaveText('application/pdf');
+  await expect(currentRow.getByTestId('version-file-size')).toHaveText('1.8 MiB');
+  await expect(currentRow.getByTestId('version-sha256')).toHaveText(
+    `${FILE_METADATA.sha256.slice(0, 12)}…`
+  );
+  await expect(currentRow.getByTestId('version-uploaded')).toContainText('Oct 20, 2026');
+
+  const priorRow = page.getByTestId('version-row').nth(1);
+  await expect(priorRow.getByTestId('version-number')).toHaveText('v2');
+  await expect(priorRow.getByTestId('version-file-name')).toHaveText('policy-schedule-v2.pdf');
+  await expect(priorRow.getByTestId('version-current-badge')).toHaveCount(0);
+
+  const historyRead = state.requests.find(
+    (request) =>
+      request.method === 'GET' &&
+      request.path === `/api/v1/documents/${DOCUMENT_ID}/content/versions`
+  );
+  expect(historyRead).toBeTruthy();
+  expect(historyRead.headers['x-eia-tenant']).toBe(TENANT);
+});
+
+test('downloads a retained version as a blob under its stored file name', async ({ page }) => {
+  const bytes = Buffer.from('%PDF-1.7 version two\n');
+  const state = await installContentMock(page, {
+    contents: { [DOCUMENT_ID]: { ...FILE_METADATA, currentVersion: 3 } },
+    contentBytes: { [DOCUMENT_ID]: Buffer.from('%PDF-1.7 version three\n') },
+    versions: { [DOCUMENT_ID]: FILE_VERSIONS },
+    versionBytes: { [DOCUMENT_ID]: { 2: bytes } }
+  });
+
+  await page.goto('/');
+  await openFileTab(page);
+
+  const row = page.getByTestId('version-row').filter({ hasText: 'policy-schedule-v2.pdf' });
+  const downloadPromise = page.waitForEvent('download');
+  await row.getByTestId('download-version').click();
+  const download = await downloadPromise;
+
+  expect(download.suggestedFilename()).toBe('policy-schedule-v2.pdf');
+  const downloadPath = await download.path();
+  expect(downloadPath).toBeTruthy();
+  expect((await readFile(downloadPath)).equals(bytes)).toBe(true);
+  await expect(page.getByTestId('version-download-notice')).toContainText(
+    'Version 2 (policy-schedule-v2.pdf) downloaded.'
+  );
+
+  const read = state.requests.find(
+    (request) =>
+      request.method === 'GET' &&
+      request.path === `/api/v1/documents/${DOCUMENT_ID}/content/versions/2`
+  );
+  expect(read).toBeTruthy();
+  expect(read.headers['x-eia-tenant']).toBe(TENANT);
+});
+
+test('uploads a new version and refreshes the current version and history', async ({ page }) => {
+  const current = Buffer.from('%PDF-1.7 version three\n');
+  const replacement = Buffer.from('replacement policy schedule evidence\n');
+  const state = await installContentMock(page, {
+    contents: { [DOCUMENT_ID]: { ...FILE_METADATA, currentVersion: 3 } },
+    contentBytes: { [DOCUMENT_ID]: current },
+    versions: { [DOCUMENT_ID]: FILE_VERSIONS },
+    versionBytes: { [DOCUMENT_ID]: { 3: current } }
+  });
+
+  await page.goto('/');
+  await openFileTab(page);
+  await expect(page.getByTestId('content-current-version')).toHaveText('v3');
+
+  await page.getByTestId('toggle-upload-version').click();
+  await expect(page.getByTestId('version-file-dropzone')).toBeVisible();
+  await page.getByLabel('New version file').setInputFiles({
+    name: 'policy-schedule-v4.pdf',
+    mimeType: 'application/pdf',
+    buffer: replacement
+  });
+  await expect(page.getByTestId('version-selected-file')).toContainText('policy-schedule-v4.pdf');
+  await page.getByRole('button', { name: 'Upload new version' }).click();
+
+  await expect(page.getByTestId('upload-notice')).toContainText(
+    'was uploaded and stored as evidence'
+  );
+  await expect(page.getByTestId('content-current-version')).toHaveText('v4');
+  await expect(page.getByTestId('version-count')).toHaveText('4 versions');
+  await expect(page.getByTestId('version-row')).toHaveCount(4);
+
+  const newest = page.getByTestId('version-row').first();
+  await expect(newest.getByTestId('version-number')).toHaveText('v4');
+  await expect(newest.getByTestId('version-file-name')).toHaveText('policy-schedule-v4.pdf');
+  await expect(newest.getByTestId('version-file-size')).toHaveText(`${replacement.length} B`);
+  await expect(newest.getByTestId('version-current-badge')).toBeVisible();
+
+  const upload = state.requests.find(
+    (request) =>
+      request.method === 'PUT' &&
+      request.path === `/api/v1/documents/${DOCUMENT_ID}/content`
+  );
+  expect(upload).toBeTruthy();
+  expect(upload.headers['x-eia-tenant']).toBe(TENANT);
+  expect(upload.headers['x-file-name']).toBe('policy-schedule-v4.pdf');
+  expect(upload.body.equals(replacement)).toBe(true);
+  expect(
+    state.requests.filter(
+      (request) =>
+        request.method === 'GET' &&
+        request.path === `/api/v1/documents/${DOCUMENT_ID}/content/versions`
+    )
+  ).toHaveLength(2);
+});
+
+test('shows an empty version history and treats legacy content as version 1', async ({ page }) => {
+  await installContentMock(page, {
+    contents: { [DOCUMENT_ID]: { ...FILE_METADATA, currentVersion: 1 } },
+    contentBytes: { [DOCUMENT_ID]: Buffer.from('%PDF-1.7 legacy content\n') }
+  });
+
+  await page.goto('/');
+  await openFileTab(page);
+
+  await expect(page.getByTestId('content-current-version')).toHaveText('v1');
+  const empty = page.getByTestId('version-history-empty');
+  await expect(empty).toContainText('No version history yet');
+  await expect(empty).toContainText('The current file is version 1');
+  await expect(page.getByTestId('version-history-table')).toHaveCount(0);
+  await expect(page.getByTestId('version-row')).toHaveCount(0);
+});
+
+test('contains version history read errors and retries', async ({ page }) => {
+  const state = await installContentMock(page, {
+    contents: { [DOCUMENT_ID]: { ...FILE_METADATA, currentVersion: 3 } },
+    contentBytes: { [DOCUMENT_ID]: Buffer.from('%PDF-1.7 version three\n') },
+    versions: { [DOCUMENT_ID]: FILE_VERSIONS },
+    versionsStatus: 503,
+    versionsError: {
+      code: 'CONTENT_VERSIONS_UNAVAILABLE',
+      message: 'Version history is temporarily unavailable.'
+    }
+  });
+
+  await page.goto('/');
+  await openFileTab(page);
+
+  const failure = page.getByTestId('version-history-error');
+  await expect(failure).toContainText('CONTENT_VERSIONS_UNAVAILABLE');
+  await expect(failure).toContainText('Version history is temporarily unavailable.');
+  await expect(page.getByTestId('version-row')).toHaveCount(0);
+  await expect(page.getByTestId('content-current-version')).toHaveText('v3');
+
+  state.versionsStatus = 0;
+  await failure.getByRole('button', { name: 'Retry' }).click();
+
+  await expect(page.getByTestId('version-history-table')).toBeVisible();
+  await expect(page.getByTestId('version-row')).toHaveCount(3);
+  await expect(page.getByTestId('version-count')).toHaveText('3 versions');
+  expect(
+    state.requests.filter(
+      (request) =>
+        request.method === 'GET' &&
+        request.path === `/api/v1/documents/${DOCUMENT_ID}/content/versions`
+    )
+  ).toHaveLength(2);
+});
+
+test('contains a failed version download', async ({ page }) => {
+  await installContentMock(page, {
+    contents: { [DOCUMENT_ID]: { ...FILE_METADATA, currentVersion: 3 } },
+    contentBytes: { [DOCUMENT_ID]: Buffer.from('%PDF-1.7 version three\n') },
+    versions: { [DOCUMENT_ID]: FILE_VERSIONS },
+    versionDownloadStatus: 500,
+    versionDownloadError: {
+      code: 'CONTENT_VERSION_READ_FAILED',
+      message: 'The stored version could not be read.'
+    }
+  });
+
+  await page.goto('/');
+  await openFileTab(page);
+
+  const row = page.getByTestId('version-row').filter({ hasText: 'policy-schedule-v2.pdf' });
+  const button = row.getByTestId('download-version');
+  await button.click();
+
+  const failure = page.getByTestId('version-download-error');
+  await expect(failure).toContainText('CONTENT_VERSION_READ_FAILED');
+  await expect(failure).toContainText('The stored version could not be read.');
+  await expect(button).toBeEnabled();
+  await expect(page.getByTestId('version-download-notice')).toHaveCount(0);
 });
