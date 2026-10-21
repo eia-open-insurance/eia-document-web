@@ -46,3 +46,13 @@ The format is based on Keep a Changelog and the project uses Semantic Versioning
   after creating the metadata; upload errors leave the registered document intact and are
   contained in the File tab. Playwright covers the upload headers/body, metadata rendering,
   download, empty state, oversized rejection, and failure states.
+- Legal hold and disposition: the **Retention** tab shows the hold status, hold reason, held
+  date, status before hold, disposition date, and disposition eligibility. "Place legal hold"
+  opens a reason modal and posts `/api/v1/documents/{id}/hold`; "Release hold" posts
+  `/api/v1/documents/{id}/hold/release`; "Dispose document" requires a red irreversible-action
+  confirmation and posts `/api/v1/documents/{id}/dispose`. A hold blocks disposition, and a
+  disposition destroys content while retaining the audit trail and disposition certificate.
+  Ineligible actions are disabled with a visible explanation (already held, not held, already
+  disposed, no retention date, or retention date not reached). The queue and record are updated
+  from the command response, with the commanded facts filling in a 204 or narrow projection.
+  Playwright covers place, release, dispose, blocked eligibility, and all three error paths.

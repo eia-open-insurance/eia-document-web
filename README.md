@@ -67,6 +67,29 @@ history ordering and columns, version blob download, upload refresh, empty
 history, version/read errors, metadata rendering, current download, empty
 state, and oversized rejection.
 
+## Retention, legal hold, and disposition
+
+The **Retention** tab reads the retention and hold facts already carried by the
+document record (`retentionUntil`, the legal-hold flag and reason, the held
+date, `statusBeforeHold`, and `disposedAt`) and offers the governed actions:
+
+- `POST /api/v1/documents/{documentId}/hold` with `{ "reason": "…" }` places a
+  legal hold. The reason is required and travels with the audit trail.
+- `POST /api/v1/documents/{documentId}/hold/release` releases the active hold;
+  the record returns to the status it held before the hold.
+- `POST /api/v1/documents/{documentId}/dispose` disposes the record after a red
+  confirmation. Disposition is irreversible: the stored content is destroyed,
+  while the document tombstone, audit trail, and disposition certificate are
+  retained.
+
+A legal hold blocks disposition. The dispose action is enabled only when a
+retention date is set, that date has been reached, no hold is active, and the
+record is not already disposed; otherwise the tab shows the disabled reason
+inline and as the button title. A successful action updates the record in the
+queue and the panel from the API response, falling back to the commanded facts
+when the API answers 204 or a narrow projection. Place, release, dispose, and
+their blocked and error states are covered by `tests/retention.spec.js`.
+
 ## Verification
 
 - Lint and format

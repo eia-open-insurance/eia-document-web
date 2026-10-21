@@ -97,6 +97,28 @@ export const api = {
       request(`${API_BASE}/${encodeURIComponent(documentId)}/status`, {
         method: 'POST',
         body: JSON.stringify({ status })
+      }),
+    /**
+     * Places a legal hold. The reason is the audit fact for the hold, so it is
+     * always sent; a hold suspends disposition until it is explicitly released.
+     */
+    placeHold: (documentId, reason) =>
+      request(`${API_BASE}/${encodeURIComponent(documentId)}/hold`, {
+        method: 'POST',
+        body: JSON.stringify({ reason })
+      }),
+    /** Releases the active hold; the record returns to its pre-hold status. */
+    releaseHold: (documentId) =>
+      request(`${API_BASE}/${encodeURIComponent(documentId)}/hold/release`, {
+        method: 'POST'
+      }),
+    /**
+     * Irreversibly disposes the document. The content is destroyed; the record
+     * tombstone, audit trail, and disposition certificate are retained.
+     */
+    dispose: (documentId) =>
+      request(`${API_BASE}/${encodeURIComponent(documentId)}/dispose`, {
+        method: 'POST'
       })
   },
   links: {

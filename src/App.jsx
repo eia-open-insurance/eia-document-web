@@ -24,6 +24,7 @@ import {
 } from './documentLinks.js';
 import { navigate, recordHref } from './navigation.js';
 import { activityEvents } from './events.js';
+import { HOLD_REASON_MAX_LENGTH, retentionView } from './retention.js';
 
 // SPEC 11.6.5 DocumentType.
 const DOCUMENT_TYPES = [
@@ -161,6 +162,17 @@ function formatTimestamp(value) {
   });
 }
 
+/**
+ * Calendar dates (the API's date-only shape) are shown exactly as returned; a
+ * timestamp is rendered in the operator's locale. Parsing a date-only value as
+ * an instant would shift it by a day in a negative-offset timezone.
+ */
+function formatMoment(value) {
+  if (!value) return '—';
+  const raw = String(value);
+  return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : formatTimestamp(raw);
+}
+
 function shortId(value) {
   if (!value) return '—';
   const text = String(value);
@@ -216,6 +228,13 @@ export default function App() {
   const [removingLinkId, setRemovingLinkId] = useState('');
   const [activity, setActivity] = useState(EMPTY_ACTIVITY);
   const [activityNonce, setActivityNonce] = useState(0);
+  const [holdOpen, setHoldOpen] = useState(false);
+  const [holdReason, setHoldReason] = useState('');
+  const [holdBusy, setHoldBusy] = useState(false);
+  const [holdError, setHoldError] = useState('');
+  const [disposeOpen, setDisposeOpen] = useState(false);
+  const [disposeBusy, setDisposeBusy] = useState(false);
+  const [disposeError, setDisposeError] = useState('');
 
   const documentsRef = useRef([]);
   const registerOpenRef = useRef(false);
@@ -223,6 +242,7 @@ export default function App() {
   const activityRequestRef = useRef(0);
 
   const selectedDocument = documents.find((document) => document.id === selectedId) || null;
+  const selectedRetention = selectedDocument ? retentionView(selectedDocument) : null;
   const filteredDocuments = filterDocuments(documents, queueFilter);
   // Never show one document's events under another document's header while a
   // selection change is still in flight.
@@ -495,12 +515,44 @@ export default function App() {
   }, [linkOpen, linkBusy]);
 
   useEffect(() => {
+    if (!holdOpen) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape' && !holdBusy) {
+        setHoldOpen(false);
+        setHoldReason('');
+        setHoldError('');
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [holdOpen, holdBusy]);
+
+  useEffect(() => {
+    if (!disposeOpen) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape' && !disposeBusy) {
+        setDisposeOpen(false);
+        setDisposeError('');
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [disposeOpen, disposeBusy]);
+
+  useEffect(() => {
     // The add-link form belongs to one document; never carry a half-selected
     // record across a queue change.
     setLinkOpen(false);
     setLinkForm(EMPTY_LINK_FORM);
     setLinkError('');
     setRemovingLinkId('');
+    // A hold or disposition dialog is about the record that opened it; a queue
+    // change must never leave a stale confirmation armed for another record.
+    setHoldOpen(false);
+    setHoldReason('');
+    setHoldError('');
+    setDisposeOpen(false);
+    setDisposeError('');
   }, [selectedId]);
 
   function update(field) {
@@ -686,6 +738,154 @@ export default function App() {
       setError(cause.message);
     } finally {
       setStatusBusy(false);
+    }
+  }
+
+  /**
+   * Applies a retention command to the document record. The API normally
+   * returns the updated document; a 204, or a projection that omits the new
+   * hold/disposition facts, is completed from the outcome we just commanded.
+   */
+  function applyDocumentUpdate(documentId, result, fallback = {}) {
+    const payload = result && typeof result === 'object' ? result : null;
+    const candidate = payload && payload.document && typeof payload.document === 'object'
+      ? payload.document
+      : payload;
+    const authoritative = candidate && candidate.id === documentId ? candidate : null;
+
+    setDocuments((current) =>
+      current.map((document) => {
+        if (document.id !== documentId) return document;
+        return authoritative
+          ? { ...document, ...fallback, ...authoritative }
+          : { ...document, ...fallback };
+      })
+    );
+  }
+
+  function openHoldDialog() {
+    if (!selectedDocument || !selectedRetention?.canPlaceHold) return;
+    setHoldReason('');
+    setHoldError('');
+    setHoldOpen(true);
+  }
+
+  function closeHoldDialog() {
+    if (holdBusy) return;
+    setHoldOpen(false);
+    setHoldReason('');
+    setHoldError('');
+  }
+
+  async function submitHold(event) {
+    event.preventDefault();
+    if (holdBusy || !selectedDocument) return;
+    const document = selectedDocument;
+    const reason = holdReason.trim();
+    if (!reason) {
+      setHoldError('A reason is required to place a legal hold.');
+      return;
+    }
+
+    setHoldBusy(true);
+    setHoldError('');
+    setError('');
+    setNotice('');
+    try {
+      const updated = await api.documents.placeHold(document.id, reason);
+      applyDocumentUpdate(document.id, updated, {
+        status: 'ON_HOLD',
+        legalHold: true,
+        legalHoldFlag: true,
+        holdReason: reason,
+        heldAt: new Date().toISOString(),
+        statusBeforeHold: document.status === 'ON_HOLD'
+          ? document.statusBeforeHold || ''
+          : document.status
+      });
+      setHoldOpen(false);
+      setHoldReason('');
+      setNotice(`Legal hold placed on ${document.documentNumber}.`);
+      setActivityNonce((value) => value + 1);
+    } catch (cause) {
+      setHoldError(cause.message);
+    } finally {
+      setHoldBusy(false);
+    }
+  }
+
+  async function releaseHold() {
+    if (holdBusy || !selectedDocument) return;
+    const document = selectedDocument;
+    const view = retentionView(document);
+    if (!view.canReleaseHold) return;
+    const restoredStatus = view.hold.statusBeforeHold || 'ACTIVE';
+
+    setHoldBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      const updated = await api.documents.releaseHold(document.id);
+      applyDocumentUpdate(document.id, updated, {
+        status: restoredStatus,
+        legalHold: false,
+        legalHoldFlag: false,
+        hold: null,
+        holdReason: null,
+        heldAt: null,
+        statusBeforeHold: null
+      });
+      setNotice(`Legal hold released on ${document.documentNumber}.`);
+      setActivityNonce((value) => value + 1);
+    } catch (cause) {
+      setError(cause.message);
+    } finally {
+      setHoldBusy(false);
+    }
+  }
+
+  function openDisposeDialog() {
+    if (!selectedDocument || !selectedRetention?.canDispose) return;
+    setDisposeError('');
+    setDisposeOpen(true);
+  }
+
+  function closeDisposeDialog() {
+    if (disposeBusy) return;
+    setDisposeOpen(false);
+    setDisposeError('');
+  }
+
+  async function confirmDispose() {
+    if (disposeBusy || !selectedDocument) return;
+    const document = selectedDocument;
+
+    setDisposeBusy(true);
+    setDisposeError('');
+    setError('');
+    setNotice('');
+    try {
+      const updated = await api.documents.dispose(document.id);
+      applyDocumentUpdate(document.id, updated, {
+        status: 'DISPOSED',
+        disposedAt: new Date().toISOString(),
+        disposed: true,
+        legalHold: false,
+        legalHoldFlag: false,
+        hold: null,
+        holdReason: null,
+        heldAt: null,
+        statusBeforeHold: null
+      });
+      setDisposeOpen(false);
+      setNotice(
+        `Document ${document.documentNumber} disposed. The audit trail and disposition certificate are retained.`
+      );
+      setActivityNonce((value) => value + 1);
+    } catch (cause) {
+      setDisposeError(cause.message);
+    } finally {
+      setDisposeBusy(false);
     }
   }
 
@@ -1051,11 +1251,26 @@ export default function App() {
   }
 
   function renderRetention(document) {
+    const view = retentionView(document);
+    const { hold, disposition } = view;
+    const holdStatus = hold.held ? 'HELD' : 'NOT HELD';
+    const holdNote = hold.held
+      ? `On legal hold. Disposition is blocked until the hold is released${
+          hold.statusBeforeHold ? `; the record returns to ${hold.statusBeforeHold}.` : '.'
+        }`
+      : view.canPlaceHold
+        ? 'No legal hold is active. A hold suspends disposition until it is released.'
+        : view.holdBlock;
+    const disposeNote = view.canDispose
+      ? 'The retention date has been reached and no legal hold applies. Disposition is irreversible: the stored content is destroyed while the audit trail and disposition certificate are retained.'
+      : view.disposeBlock;
+    const busy = holdBusy || disposeBusy;
+
     return (
       <>
         <div className="eia-section-title">
           <h2>Retention</h2>
-          <span className="eia-muted">{document.retentionUntil ? 'Scheduled' : 'Not set'}</span>
+          <span className="eia-muted">{view.retentionUntil ? 'Scheduled' : 'Not set'}</span>
         </div>
 
         <div className="eia-grid eia-grid-2">
@@ -1066,7 +1281,7 @@ export default function App() {
               data-testid="retention-value"
               style={{ margin: '4px 0' }}
             >
-              {document.retentionUntil || 'Not set'}
+              {view.retentionUntil || 'Not set'}
             </div>
             <div className="eia-metric-label">Earliest disposition date</div>
           </section>
@@ -1084,18 +1299,157 @@ export default function App() {
           </section>
         </div>
 
-        {!document.retentionUntil && (
+        {!view.retentionUntil && (
           <div className="eia-empty" style={{ marginTop: 14 }}>
             No retention date is recorded. A retention date must be set before the document can become
             ACTIVE (DOC-05).
           </div>
         )}
 
-        <p className="eia-muted" style={{ marginTop: 14 }}>
-          Retention policy assignment, legal holds, and disposition are governed by the Document domain
-          and are not exposed by the Document API in this build. This record shows the retention date the
-          API returns.
-        </p>
+        <div className="eia-grid eia-grid-2" style={{ marginTop: 14 }}>
+          <section className="eia-card" aria-label="Legal hold" data-testid="retention-hold">
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 10
+              }}
+            >
+              <h3>Legal hold</h3>
+              <span
+                className={`eia-pill ${hold.held ? 'amber' : 'green'}`}
+                data-testid="hold-status"
+                data-status={hold.held ? 'HELD' : 'CLEARED'}
+              >
+                {holdStatus}
+              </span>
+            </div>
+            <dl className="eia-kv" style={{ marginTop: 8 }}>
+              <dt>Hold reason</dt>
+              <dd data-testid="hold-reason">{hold.reason || '—'}</dd>
+              <dt>Held date</dt>
+              <dd data-testid="hold-held-date">
+                {hold.heldAt ? (
+                  <time dateTime={hold.heldAt} title={hold.heldAt}>
+                    {formatMoment(hold.heldAt)}
+                  </time>
+                ) : (
+                  '—'
+                )}
+              </dd>
+              <dt>Status before hold</dt>
+              <dd data-testid="hold-status-before">{hold.statusBeforeHold || '—'}</dd>
+            </dl>
+            <div className="eia-actions" style={{ marginTop: 12, justifyContent: 'flex-start' }}>
+              <button
+                type="button"
+                onClick={openHoldDialog}
+                disabled={!view.canPlaceHold || busy}
+                title={view.canPlaceHold ? 'Place a legal hold on this document' : view.holdBlock}
+                aria-describedby="hold-eligibility"
+                data-testid="place-hold"
+              >
+                {holdBusy && holdOpen ? 'Placing hold…' : 'Place legal hold'}
+              </button>
+              <button
+                type="button"
+                className="eia-btn-secondary"
+                onClick={releaseHold}
+                disabled={!view.canReleaseHold || busy}
+                title={view.canReleaseHold ? 'Release the active legal hold' : view.releaseBlock}
+                aria-describedby="hold-eligibility"
+                data-testid="release-hold"
+              >
+                {holdBusy && !holdOpen ? 'Releasing…' : 'Release hold'}
+              </button>
+            </div>
+            <p
+              id="hold-eligibility"
+              className="eia-muted"
+              data-testid="hold-eligibility"
+              style={{ margin: '10px 0 0' }}
+            >
+              {holdNote}
+            </p>
+          </section>
+
+          <section
+            className="eia-card"
+            aria-label="Disposition"
+            data-testid="retention-disposition"
+          >
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 10
+              }}
+            >
+              <h3>Disposition</h3>
+              <span
+                className={`eia-pill ${
+                  disposition.disposed ? 'red' : view.canDispose ? 'green' : 'blue'
+                }`}
+                data-testid="disposition-status"
+              >
+                {disposition.disposed ? 'DISPOSED' : view.canDispose ? 'ELIGIBLE' : 'BLOCKED'}
+              </span>
+            </div>
+            <dl className="eia-kv" style={{ marginTop: 8 }}>
+              <dt>Retention date</dt>
+              <dd>{view.retentionUntil || 'Not set'}</dd>
+              <dt>Disposition date</dt>
+              <dd data-testid="disposition-date">
+                {disposition.disposedAt ? (
+                  <time dateTime={disposition.disposedAt} title={disposition.disposedAt}>
+                    {formatMoment(disposition.disposedAt)}
+                  </time>
+                ) : (
+                  '—'
+                )}
+              </dd>
+              <dt>Audit trail</dt>
+              <dd>Retained after disposition</dd>
+            </dl>
+            <div className="eia-actions" style={{ marginTop: 12, justifyContent: 'flex-start' }}>
+              <button
+                type="button"
+                className="eia-btn-danger"
+                onClick={openDisposeDialog}
+                disabled={!view.canDispose || busy}
+                title={view.canDispose ? 'Dispose this document (confirmation required)' : view.disposeBlock}
+                aria-describedby="disposition-eligibility"
+                data-testid="dispose-document"
+              >
+                {disposeBusy ? 'Disposing…' : 'Dispose document'}
+              </button>
+            </div>
+            <p
+              id="disposition-eligibility"
+              className="eia-muted"
+              data-testid="disposition-eligibility"
+              style={{ margin: '10px 0 0' }}
+            >
+              {disposeNote}
+            </p>
+          </section>
+        </div>
+
+        <section
+          className="eia-context-panel"
+          aria-label="Why this matters"
+          data-testid="retention-context"
+          style={{ marginTop: 14 }}
+        >
+          <h4>Why this matters</h4>
+          <p>
+            A legal hold blocks disposition: a held record cannot be disposed or archived out of
+            retrievability. Disposition is irreversible: the stored content is destroyed, while the
+            document tombstone, audit trail, and disposition certificate are retained.
+          </p>
+        </section>
       </>
     );
   }
@@ -1272,7 +1626,7 @@ export default function App() {
       </header>
 
       {notice && <p role="status" style={{ margin: '0 0 12px' }}>{notice}</p>}
-      {error && !registerOpen && !linkOpen && (
+      {error && !registerOpen && !linkOpen && !holdOpen && !disposeOpen && (
         <p role="alert" style={{ margin: '0 0 12px' }}>{error}</p>
       )}
 
@@ -1730,6 +2084,184 @@ export default function App() {
             {linkError && (
               <p role="alert" data-testid="link-error" style={{ margin: '10px 0 0' }}>
                 {linkError}
+              </p>
+            )}
+          </section>
+        </div>
+      )}
+
+      {holdOpen && selectedDocument && (
+        <div
+          style={OVERLAY_STYLE}
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !holdBusy) closeHoldDialog();
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="place-hold-title"
+            className="eia-card"
+            style={DIALOG_STYLE}
+            data-testid="hold-dialog"
+          >
+            <div className="eia-record-title">
+              <div>
+                <h2 id="place-hold-title" style={{ margin: 0 }}>Place legal hold</h2>
+                <p className="eia-record-subtitle">
+                  A legal hold on {selectedDocument.documentNumber} suspends disposition until it is
+                  released. It does not change the document content.
+                </p>
+              </div>
+              <button
+                type="button"
+                className="eia-btn-ghost"
+                onClick={closeHoldDialog}
+                disabled={holdBusy}
+              >
+                Close
+              </button>
+            </div>
+
+            <form
+              className="eia-form-grid"
+              aria-label="Place legal hold"
+              onSubmit={submitHold}
+              noValidate
+              style={{ marginTop: 16 }}
+            >
+              <div className="eia-field span-3">
+                <label htmlFor="hold-reason">Reason</label>
+                <textarea
+                  id="hold-reason"
+                  value={holdReason}
+                  onChange={(event) => {
+                    setHoldReason(event.target.value);
+                    setHoldError('');
+                  }}
+                  maxLength={HOLD_REASON_MAX_LENGTH}
+                  rows={3}
+                  placeholder="e.g. Litigation hold — matter 2026-0042"
+                  autoFocus
+                  required
+                  disabled={holdBusy}
+                  aria-describedby="hold-reason-hint"
+                  aria-invalid={holdError ? 'true' : undefined}
+                  data-testid="hold-reason-input"
+                />
+                <span id="hold-reason-hint" className="eia-muted" style={{ fontSize: 11 }}>
+                  Record the matter, legal authority, or regulatory basis for the hold. The reason is
+                  kept with the audit trail.
+                </span>
+                {holdError && (
+                  <span role="alert" data-testid="hold-error">
+                    {holdError}
+                  </span>
+                )}
+              </div>
+
+              <p className="eia-muted span-3" style={{ margin: 0 }}>
+                While the hold is active this document cannot be disposed. Release the hold to restore
+                its prior lifecycle status.
+              </p>
+
+              <div className="eia-actions span-3" style={{ justifyContent: 'flex-end' }}>
+                <button
+                  type="button"
+                  className="eia-btn-secondary"
+                  onClick={closeHoldDialog}
+                  disabled={holdBusy}
+                >
+                  Cancel
+                </button>
+                <button type="submit" disabled={holdBusy}>
+                  {holdBusy ? 'Placing hold…' : 'Place legal hold'}
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
+      )}
+
+      {disposeOpen && selectedDocument && (
+        <div
+          style={OVERLAY_STYLE}
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !disposeBusy) closeDisposeDialog();
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="dispose-document-title"
+            className="eia-card"
+            style={DIALOG_STYLE}
+            data-testid="dispose-dialog"
+          >
+            <div className="eia-record-title">
+              <div>
+                <h2 id="dispose-document-title" style={{ margin: 0 }}>Dispose document</h2>
+                <p className="eia-record-subtitle">
+                  Confirm the disposition of {selectedDocument.documentNumber}. This cannot be undone.
+                </p>
+              </div>
+              <button
+                type="button"
+                className="eia-btn-ghost"
+                onClick={closeDisposeDialog}
+                disabled={disposeBusy}
+              >
+                Close
+              </button>
+            </div>
+
+            <div
+              className="eia-context-panel"
+              style={{ marginTop: 16, borderLeftColor: 'var(--eia-red)' }}
+              data-testid="dispose-warning"
+            >
+              <h4 style={{ color: 'var(--eia-red)' }}>Disposition is irreversible</h4>
+              <p>
+                The stored content is destroyed. The document tombstone, audit trail, and disposition
+                certificate are retained. A disposed record cannot be held, restored, or disposed again.
+              </p>
+            </div>
+
+            <dl className="eia-kv" style={{ marginTop: 16 }}>
+              <dt>Document</dt>
+              <dd>
+                {selectedDocument.documentNumber} · {selectedDocument.title}
+              </dd>
+              <dt>Retention until</dt>
+              <dd>{selectedRetention?.retentionUntil || 'Not set'}</dd>
+              <dt>Legal hold</dt>
+              <dd>{selectedRetention?.hold.held ? 'On legal hold' : 'None'}</dd>
+            </dl>
+
+            <div className="eia-actions" style={{ marginTop: 16, justifyContent: 'flex-end' }}>
+              <button
+                type="button"
+                className="eia-btn-secondary"
+                onClick={closeDisposeDialog}
+                disabled={disposeBusy}
+                autoFocus
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="eia-btn-danger"
+                onClick={confirmDispose}
+                disabled={disposeBusy}
+                data-testid="confirm-dispose"
+              >
+                {disposeBusy ? 'Disposing…' : 'Dispose document'}
+              </button>
+            </div>
+
+            {disposeError && (
+              <p role="alert" data-testid="dispose-error" style={{ margin: '10px 0 0' }}>
+                {disposeError}
               </p>
             )}
           </section>
