@@ -10,6 +10,8 @@ const CONTRACT_ID = 'dddddddd-dddd-7ddd-8ddd-dddddddddddd';
 const PARTY_ID = 'eeeeeeee-eeee-7eee-8eee-eeeeeeeeeeee';
 const PAYMENT_ID = 'ffffffff-ffff-7fff-8fff-ffffffffffff';
 const OTHER_ID = '99999999-9999-7999-8999-999999999999';
+const MISSING_ID = '11111111-1111-7111-8111-111111111111';
+const UNAVAILABLE_ID = '22222222-2222-7222-8222-222222222222';
 
 const DOCUMENT = {
   id: DOCUMENT_ID,
@@ -130,18 +132,72 @@ const SEARCH_ITEMS = {
   }
 };
 
+/** Detail projections used to hydrate labels for links stored without one. */
+const DETAIL_ITEMS = {
+  [`/api/v1/claims/${DIRECT_CLAIM_ID}`]: {
+    id: DIRECT_CLAIM_ID,
+    claimNumber: 'CLM-2026-0000001'
+  },
+  [`/api/v1/assumed-claims/claims/${ASSUMED_CLAIM_ID}`]: {
+    id: ASSUMED_CLAIM_ID,
+    assumedClaimNumber: 'ACL-2026-0000001'
+  },
+  [`/api/v1/policies/${POLICY_ID}`]: {
+    id: POLICY_ID,
+    policyNumber: 'POL-2026-0000001'
+  },
+  [`/api/v1/contracts/${CONTRACT_ID}`]: {
+    id: CONTRACT_ID,
+    contractNumber: 'CNT-2026-0000001'
+  },
+  [`/api/v1/parties/${PARTY_ID}`]: {
+    id: PARTY_ID,
+    partyNumber: 'PTY-000000001',
+    displayName: 'Acme Manufacturing'
+  },
+  [`/api/v1/payments/${PAYMENT_ID}`]: {
+    id: PAYMENT_ID,
+    paymentNumber: 'PAY-2026-0000001'
+  }
+};
+
+/** Stored links that predate the picker and therefore carry no reference. */
+const UNLABELLED_LINKS = ALL_ROUTE_LINKS.filter((link) => link.linkedType !== 'OTHER').map(
+  ({ linkedReference, ...link }) => link
+);
+
+const HYDRATION_CASES = [
+  ['DIRECT_CLAIM', `/api/v1/claims/${DIRECT_CLAIM_ID}`, 'DIRECT', 'CLM-2026-0000001'],
+  [
+    'ASSUMED_CLAIM',
+    `/api/v1/assumed-claims/claims/${ASSUMED_CLAIM_ID}`,
+    'ASSUMED',
+    'ACL-2026-0000001'
+  ],
+  ['POLICY', `/api/v1/policies/${POLICY_ID}`, 'DIRECT', 'POL-2026-0000001'],
+  ['CONTRACT', `/api/v1/contracts/${CONTRACT_ID}`, 'ASSUMED', 'CNT-2026-0000001'],
+  ['PARTY', `/api/v1/parties/${PARTY_ID}`, '', 'PTY-000000001'],
+  ['PAYMENT', `/api/v1/payments/${PAYMENT_ID}`, '', 'PAY-2026-0000001']
+];
+
 /**
  * Stateful mock of the Document API plus the six cross-vertical search
  * endpoints the link picker can call. Links are returned on the document
  * record, matching the production projection.
  */
-async function installDocumentMock(page, { links = [], duplicate = false } = {}) {
+async function installDocumentMock(
+  page,
+  { links = [], duplicate = false, searchStatus = 0, detailFailures = {} } = {}
+) {
   const state = {
     documents: [{ ...DOCUMENT }],
     links: links.map((link) => ({ ...link })),
     requests: [],
     searches: [],
-    duplicate
+    details: [],
+    detailFailures: { ...detailFailures },
+    duplicate,
+    searchStatus
   };
 
   await page.route('**/api/v1/documents**', async (route) => {
@@ -218,6 +274,16 @@ async function installDocumentMock(page, { links = [], duplicate = false } = {})
       book: request.headers()['x-eia-book'] || '',
       headers: request.headers()
     });
+    if (state.searchStatus) {
+      return route.fulfill({
+        status: state.searchStatus,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          code: 'SEARCH_UNAVAILABLE',
+          message: 'Record search is temporarily unavailable.'
+        })
+      });
+    }
     if (!item) {
       return route.fulfill({
         status: 404,
@@ -235,6 +301,45 @@ async function installDocumentMock(page, { links = [], duplicate = false } = {})
       })
     });
   });
+
+  await page.route(
+    /\/api\/v1\/(?:claims|policies|contracts|parties|payments|assumed-claims\/claims)\/[0-9a-f-]{36}$/i,
+    async (route) => {
+      const request = route.request();
+      const path = new URL(request.url()).pathname;
+      state.details.push({
+        path,
+        book: request.headers()['x-eia-book'] || '',
+        headers: request.headers()
+      });
+
+      const failure = state.detailFailures[path];
+      if (failure) {
+        return route.fulfill({
+          status: failure,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            code: 'DETAIL_UNAVAILABLE',
+            message: `Detail read failed (${failure})`
+          })
+        });
+      }
+
+      const item = DETAIL_ITEMS[path];
+      if (!item) {
+        return route.fulfill({
+          status: 404,
+          contentType: 'application/json',
+          body: JSON.stringify({ code: 'NOT_FOUND', message: `No record at ${path}` })
+        });
+      }
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(item)
+      });
+    }
+  );
 
   return state;
 }
@@ -308,6 +413,94 @@ test('renders linked records with type badges, added dates, and every shell rout
     .getByTestId('link-record')
     .click();
   await expect(page).toHaveURL(new RegExp(`/direct-claims\\?record=${DIRECT_CLAIM_ID}$`));
+});
+
+test('hydrates stored link labels from the owning vertical detail read', async ({ page }) => {
+  const state = await installDocumentMock(page, { links: UNLABELLED_LINKS });
+
+  await page.goto('/');
+  await openAssociations(page);
+
+  const table = page.getByRole('table', { name: 'Document links' });
+  await expect(table.locator('tbody tr')).toHaveCount(6);
+
+  for (const [type, path, book, label] of HYDRATION_CASES) {
+    const row = table.locator('tbody tr').filter({ hasText: type });
+    await expect(row.getByTestId('link-reference')).toHaveText(label);
+    await expect(row.getByTestId('link-record')).toHaveText(label);
+
+    const detail = state.details.find((entry) => entry.path === path);
+    expect(detail).toBeTruthy();
+    expect(detail.headers['x-eia-tenant']).toBe(TENANT);
+    expect(detail.book).toBe(book);
+  }
+
+  // One detail read per unlabelled link; the hydrated state does not refetch
+  // on the re-render that the resolved labels cause.
+  expect(state.details).toHaveLength(6);
+});
+
+test('keeps a stored reference without a detail read', async ({ page }) => {
+  const state = await installDocumentMock(page, { links: [CLAIM_LINK] });
+
+  await page.goto('/');
+  await openAssociations(page);
+
+  const row = page.getByTestId('document-link-row');
+  await expect(row.getByTestId('link-reference')).toHaveText('CLM-2026-0000001');
+  expect(state.details).toHaveLength(0);
+});
+
+test('falls back to the short id when a linked record cannot be read', async ({ page }) => {
+  const missingLink = {
+    id: '0192f3a4-5b1c-7e2d-9a3f-6c8d1e0b4d01',
+    linkedType: 'POLICY',
+    linkedId: MISSING_ID,
+    addedAt: '2026-10-20T12:07:00Z'
+  };
+  const unavailableLink = {
+    id: '0192f3a4-5b1c-7e2d-9a3f-6c8d1e0b4d02',
+    linkedType: 'CONTRACT',
+    linkedId: UNAVAILABLE_ID,
+    addedAt: '2026-10-20T12:08:00Z'
+  };
+  const state = await installDocumentMock(page, {
+    links: [CLAIM_LINK, missingLink, unavailableLink],
+    detailFailures: {
+      [`/api/v1/policies/${MISSING_ID}`]: 404,
+      [`/api/v1/contracts/${UNAVAILABLE_ID}`]: 503
+    }
+  });
+
+  await page.goto('/');
+  await openAssociations(page);
+
+  const table = page.getByRole('table', { name: 'Document links' });
+  await expect(table.locator('tbody tr')).toHaveCount(3);
+
+  const storedRow = table.locator('tbody tr').filter({ hasText: 'CLM-2026-0000001' });
+  await expect(storedRow.getByTestId('link-reference')).toHaveText('CLM-2026-0000001');
+
+  const missingRow = table.locator('tbody tr').filter({ hasText: 'POLICY' });
+  await expect(missingRow.getByTestId('link-reference')).toHaveText('11111111…');
+  await expect(missingRow.getByTestId('link-record')).toHaveText('11111111…');
+
+  const unavailableRow = table.locator('tbody tr').filter({ hasText: 'CONTRACT' });
+  await expect(unavailableRow.getByTestId('link-reference')).toHaveText('22222222…');
+
+  // A failed detail read never blocks the document and is not retried on
+  // every render; the stored reference needs no read at all.
+  await expect(page.getByRole('heading', { name: DOCUMENT.documentNumber })).toBeVisible();
+  expect(
+    state.details.filter((entry) => entry.path.startsWith('/api/v1/claims/'))
+  ).toHaveLength(0);
+  expect(
+    state.details.filter(
+      (entry) =>
+        entry.path === `/api/v1/policies/${MISSING_ID}` ||
+        entry.path === `/api/v1/contracts/${UNAVAILABLE_ID}`
+    )
+  ).toHaveLength(2);
 });
 
 test('adds a direct-claim link from the predictive picker with the link payload', async ({ page }) => {
@@ -398,6 +591,42 @@ test('changes the picker endpoint and book for every linked type', async ({ page
   await expect(dialog.getByLabel('Reference')).toBeVisible();
   await expect(dialog.getByLabel('UUID')).toBeVisible();
   await expect(dialog.getByPlaceholder('Search by number or name…')).toHaveCount(0);
+});
+
+test('debounces rapid picker typing into a single search request', async ({ page }) => {
+  const state = await installDocumentMock(page);
+
+  await page.goto('/');
+  await openAssociations(page);
+  await page.getByRole('button', { name: 'Add link' }).click();
+
+  const dialog = page.getByRole('dialog', { name: 'Add link' });
+  const picker = dialog.getByPlaceholder('Search by number or name…');
+  await picker.pressSequentially('CLM-2026', { delay: 20 });
+  await expect(dialog.getByRole('button', { name: /CLM-2026-0000001/ })).toBeVisible();
+  await page.waitForTimeout(250);
+
+  const searches = state.searches.filter((entry) => entry.path === '/api/v1/claims/search');
+  expect(searches).toHaveLength(1);
+  expect(searches[0].query).toBe('CLM-2026');
+  expect(searches[0].book).toBe('DIRECT');
+  expect(searches[0].headers['x-eia-tenant']).toBe(TENANT);
+});
+
+test('contains a failed predictive lookup without submitting a link', async ({ page }) => {
+  const state = await installDocumentMock(page, { searchStatus: 503 });
+
+  await page.goto('/');
+  await openAssociations(page);
+  await page.getByRole('button', { name: 'Add link' }).click();
+
+  const dialog = page.getByRole('dialog', { name: 'Add link' });
+  await dialog.getByPlaceholder('Search by number or name…').fill('CLM-2026');
+  await expect(dialog.getByText('Lookup failed (503)')).toBeVisible();
+
+  await dialog.getByRole('button', { name: 'Add link' }).click();
+  await expect(dialog.getByTestId('link-error')).toContainText('Select a linked record');
+  expect(state.requests.filter((request) => request.method === 'POST')).toHaveLength(0);
 });
 
 test('removes a link with DELETE and clears the row', async ({ page }) => {

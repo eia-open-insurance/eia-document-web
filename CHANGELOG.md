@@ -8,6 +8,17 @@ The format is based on Keep a Changelog and the project uses Semantic Versioning
 
 ### Added
 
+- Existing document links now hydrate their display reference from the linked
+  record's detail read (`GET /api/v1/claims/{id}`,
+  `/api/v1/assumed-claims/claims/{id}`, `/api/v1/policies/{id}`,
+  `/api/v1/contracts/{id}`, `/api/v1/parties/{id}`, or
+  `/api/v1/payments/{id}`). Each lookup carries `X-EIA-Tenant` and the owning
+  book wall (`DIRECT` for direct claims and policies, `ASSUMED` for assumed
+  claims and contracts, none for parties and payments). A link that already
+  carries a stored reference is not looked up; a missing record or unavailable
+  service keeps the short-id fallback and never blocks the document or the
+  association table. Playwright covers hydration across all six verticals,
+  the fallback, request containment, picker lookup errors, and debouncing.
 - Related notifications on the document **Overview**: reads
   `GET /api/v1/notifications?sourceType=DOCUMENT&sourceId=<documentId>` with
   `X-EIA-Tenant` and no book header, accepts a bare array or an `{items}`

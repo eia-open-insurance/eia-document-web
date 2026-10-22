@@ -19,10 +19,14 @@ import {
   buildLinkPayload,
   documentLinks,
   emptyLinkForm,
+  linkDetailLabel,
   linkHref,
+  linkLabel,
+  linkLabelKey,
   linkReference,
   linkTypeBook,
   linkTypeDefinition,
+  linkTypeDetailUrl,
   linkTypeEndpoint,
   linkTypeLabel,
   linkTypeTone,
@@ -239,6 +243,9 @@ export default function App() {
   const [linkBusy, setLinkBusy] = useState(false);
   const [linkError, setLinkError] = useState('');
   const [removingLinkId, setRemovingLinkId] = useState('');
+  // Display labels resolved from the owning vertical for links that were
+  // stored before the picker (they may carry only linkedType/linkedId).
+  const [linkLabels, setLinkLabels] = useState({});
   const [activity, setActivity] = useState(EMPTY_ACTIVITY);
   const [activityNonce, setActivityNonce] = useState(0);
   const [notifications, setNotifications] = useState(EMPTY_NOTIFICATIONS);
@@ -258,6 +265,7 @@ export default function App() {
   const registerOpenRef = useRef(false);
   const applyingUrlRef = useRef(false);
   const activityRequestRef = useRef(0);
+  const linkLookupsRef = useRef(new Map());
 
   const selectedDocument = documents.find((document) => document.id === selectedId) || null;
   const selectedRetention = selectedDocument ? retentionView(selectedDocument) : null;
@@ -281,6 +289,13 @@ export default function App() {
       : { recordId: selectedDocument.id, items: [], count: 0, loading: true, error: '' };
   const linkDefinition = linkTypeDefinition(linkForm.linkedType);
   const linkIsManual = !linkDefinition || linkDefinition.manual;
+  // A stable signature lets the hydration effect react when the selected
+  // document's associations (not its unrelated fields) change.
+  const selectedLinkSignature = selectedDocument
+    ? documentLinks(selectedDocument)
+        .map((link) => `${linkLabelKey(link)}:${link.linkedReference}`)
+        .join('|')
+    : '';
 
   async function load() {
     const rows = await api.documents.list();
@@ -471,6 +486,48 @@ export default function App() {
       alive = false;
     };
   }, [selectedId, detailNonce]);
+
+  /**
+   * Existing associations can predate the predictive picker and carry only
+   * `linkedType`/`linkedId`. Resolve their display label from the owning
+   * vertical's detail read. This is a display enhancement: the document and
+   * its table render immediately, a failed or missing lookup keeps the short
+   * id fallback, and no association is ever mutated by the read.
+   */
+  useEffect(() => {
+    if (!selectedDocument) return undefined;
+    const pending = documentLinks(selectedDocument).filter(
+      (link) =>
+        !String(link.linkedReference || '').trim() &&
+        linkTypeDetailUrl(link.linkedType, link.linkedId)
+    );
+    if (pending.length === 0) return undefined;
+
+    let alive = true;
+    for (const link of pending) {
+      const key = linkLabelKey(link);
+      let lookup = linkLookupsRef.current.get(key);
+      if (!lookup) {
+        lookup = api.linkedRecords.get(link.linkedType, link.linkedId);
+        linkLookupsRef.current.set(key, lookup);
+      }
+      lookup
+        .then((detail) => {
+          const resolved = linkDetailLabel(link.linkedType, detail);
+          if (!alive || !resolved) return;
+          setLinkLabels((current) =>
+            current[key] === resolved ? current : { ...current, [key]: resolved }
+          );
+        })
+        .catch(() => {
+          // Display-only lookup: the short id remains the fallback.
+        });
+    }
+
+    return () => {
+      alive = false;
+    };
+  }, [selectedId, selectedLinkSignature]);
 
   /**
    * Activity is derived from the platform event stream, keyed by the document
@@ -1137,7 +1194,7 @@ export default function App() {
     try {
       const result = await api.links.remove(selectedDocument.id, link.id);
       applyLinkResult(selectedDocument.id, result, null, link.id);
-      setNotice(`Link to ${linkReference(link)} removed.`);
+      setNotice(`Link to ${linkLabel(link, linkLabels) || linkReference(link)} removed.`);
       setActivityNonce((value) => value + 1);
     } catch (cause) {
       setError(cause.message);
@@ -1235,11 +1292,12 @@ export default function App() {
               {links.map((link) => {
                 const href = linkHref(link);
                 const key = link.id || `${link.linkedType}:${link.linkedId}`;
+                const label = linkLabel(link, linkLabels) || shortId(link.linkedId);
                 return (
                   <li key={key}>
                     <span>
                       <LinkTypeBadge type={link.linkedType} />{' '}
-                      {link.linkedReference || shortId(link.linkedId)}
+                      {label}
                     </span>
                     {href ? (
                       <a
@@ -1651,7 +1709,7 @@ export default function App() {
               </thead>
               <tbody>
                 {links.map((link) => {
-                  const reference = link.linkedReference || shortId(link.linkedId);
+                  const reference = linkLabel(link, linkLabels) || shortId(link.linkedId);
                   const href = linkHref(link);
                   const key = link.id || `${link.linkedType}:${link.linkedId}`;
                   return (
@@ -1675,7 +1733,7 @@ export default function App() {
                           </a>
                         ) : (
                           <span className="eia-mono" title={link.linkedId} data-testid="link-record">
-                            {link.linkedId ? shortId(link.linkedId) : '—'}
+                            {reference || '—'}
                           </span>
                         )}
                       </td>

@@ -5,6 +5,7 @@ import {
   fileNameFromContentDisposition
 } from './documentContent.js';
 import { documentNotificationsEndpoint } from './notifications.js';
+import { linkTypeBook, linkTypeDetailUrl } from './documentLinks.js';
 
 export const TENANT = '11111111-1111-7111-8111-111111111111';
 export const API_BASE = '/api/v1/documents';
@@ -144,6 +145,19 @@ export const api = {
         `${API_BASE}/${encodeURIComponent(documentId)}/links/${encodeURIComponent(linkId)}`,
         { method: 'DELETE' }
       )
+  },
+  /**
+   * Display-only label lookup for a linked record. The read stays inside the
+   * owning vertical's book wall; a missing record or unavailable service is
+   * contained by the caller and never blocks the document.
+   */
+  linkedRecords: {
+    get: (linkedType, linkedId) => {
+      const path = linkTypeDetailUrl(linkedType, linkedId);
+      if (!path) return Promise.resolve(null);
+      const book = linkTypeBook(linkedType);
+      return request(path, { headers: book ? { 'X-EIA-Book': book } : {} });
+    }
   },
   content: {
     /**

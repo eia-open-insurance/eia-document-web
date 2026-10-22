@@ -18,6 +18,8 @@ export const LINK_TYPES = [
     value: 'DIRECT_CLAIM',
     label: 'Direct claim',
     endpoint: '/api/v1/claims/search',
+    detail: '/api/v1/claims',
+    labelFields: ['claimNumber'],
     book: 'DIRECT',
     route: 'direct-claims',
     tone: 'direct'
@@ -26,6 +28,8 @@ export const LINK_TYPES = [
     value: 'ASSUMED_CLAIM',
     label: 'Assumed claim',
     endpoint: '/api/v1/assumed-claims/search',
+    detail: '/api/v1/assumed-claims/claims',
+    labelFields: ['assumedClaimNumber', 'cedentClaimNumber'],
     book: 'ASSUMED',
     route: 'assumed-claims',
     tone: 'assumed'
@@ -34,6 +38,8 @@ export const LINK_TYPES = [
     value: 'POLICY',
     label: 'Policy',
     endpoint: '/api/v1/policies/search',
+    detail: '/api/v1/policies',
+    labelFields: ['policyNumber'],
     book: 'DIRECT',
     route: 'policy',
     tone: 'direct'
@@ -42,6 +48,8 @@ export const LINK_TYPES = [
     value: 'CONTRACT',
     label: 'Contract',
     endpoint: '/api/v1/contracts/search',
+    detail: '/api/v1/contracts',
+    labelFields: ['contractNumber'],
     book: 'ASSUMED',
     route: 'contract',
     tone: 'assumed'
@@ -50,6 +58,8 @@ export const LINK_TYPES = [
     value: 'PARTY',
     label: 'Party',
     endpoint: '/api/v1/parties/search',
+    detail: '/api/v1/parties',
+    labelFields: ['partyNumber', 'displayName'],
     book: '',
     route: 'party',
     tone: ''
@@ -58,6 +68,8 @@ export const LINK_TYPES = [
     value: 'PAYMENT',
     label: 'Payment',
     endpoint: '/api/v1/payments/search',
+    detail: '/api/v1/payments',
+    labelFields: ['paymentNumber'],
     book: '',
     route: 'payment',
     tone: ''
@@ -106,6 +118,59 @@ export function linkTypeBook(value) {
 
 export function linkTypeRoute(value) {
   return linkTypeDefinition(value)?.route || '';
+}
+
+/**
+ * Detail read for the owning vertical, or '' when the type has no detail
+ * endpoint (OTHER is a free reference). The document never writes here; the
+ * read only resolves a display label for an already stored link.
+ */
+export function linkTypeDetailUrl(value, linkedId) {
+  const definition = linkTypeDefinition(value);
+  const id = String(linkedId || '').trim();
+  if (!definition?.detail || !id) return '';
+  return `${definition.detail}/${encodeURIComponent(id)}`;
+}
+
+/** Stable cache key for one link's hydrated display label. */
+export function linkLabelKey(link) {
+  const linkedType =
+    normalizeLinkedType(link?.linkedType) ||
+    String(link?.linkedType || '').trim().toUpperCase();
+  return `${linkedType}:${String(link?.linkedId || '').trim()}`;
+}
+
+function detailText(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/**
+ * Reads the business key from a linked record's detail projection. Each
+ * vertical names its human reference differently; the trailing fields cover
+ * older projections and generic envelopes.
+ */
+export function linkDetailLabel(linkedType, detail) {
+  const source =
+    detail && typeof detail === 'object'
+      ? detail.item || detail.record || detail
+      : null;
+  if (!source || typeof source !== 'object') return '';
+
+  const definition = linkTypeDefinition(linkedType);
+  const fields = [
+    ...(definition?.labelFields || []),
+    'linkedReference',
+    'reference',
+    'businessKey',
+    'displayName',
+    'name',
+    'title'
+  ];
+  for (const field of fields) {
+    const text = detailText(source[field]);
+    if (text) return text;
+  }
+  return '';
 }
 
 export function linkTypeTone(value) {
@@ -159,6 +224,18 @@ export function documentLinks(document) {
 
 export function linkReference(link) {
   return link?.linkedReference || link?.linkedId || '';
+}
+
+/**
+ * Display label for a link: the reference stored with the association, the
+ * label hydrated from the owning vertical, or '' so the caller can fall back
+ * to the short id.
+ */
+export function linkLabel(link, labels) {
+  const stored = String(link?.linkedReference || '').trim();
+  if (stored) return stored;
+  const hydrated = labels?.[linkLabelKey(link)];
+  return typeof hydrated === 'string' ? hydrated.trim() : '';
 }
 
 /** Shell route that opens the linked record, or '' when the type has no route. */
