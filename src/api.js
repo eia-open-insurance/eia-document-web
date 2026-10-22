@@ -4,6 +4,7 @@ import {
   contentMimeType,
   fileNameFromContentDisposition
 } from './documentContent.js';
+import { documentNotificationsEndpoint } from './notifications.js';
 
 export const TENANT = '11111111-1111-7111-8111-111111111111';
 export const API_BASE = '/api/v1/documents';
@@ -252,5 +253,13 @@ export const api = {
      */
     aggregate: (documentId, limit = ACTIVITY_LIMIT) =>
       request(aggregateEventsEndpoint(documentId, limit))
+  },
+  notifications: {
+    /**
+     * Delivery artifacts whose source is this document. Notifications is a
+     * separate, tenant-scoped service; the caller contains a failure so it
+     * never blocks the document record.
+     */
+    list: (documentId) => request(documentNotificationsEndpoint(documentId))
   }
 };

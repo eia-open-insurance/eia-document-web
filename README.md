@@ -100,6 +100,22 @@ projection so the File tab shows the tombstone immediately. Place, release,
 dispose, automatic content tombstoning, and their blocked, empty-content, and
 error states are covered by `tests/retention.spec.js`.
 
+## Related notifications
+
+The **Overview** tab carries a read-only related-notifications card. It reads
+`GET /api/v1/notifications?sourceType=DOCUMENT&sourceId=<documentId>` with
+`X-EIA-Tenant` and no book header, and accepts either a bare array or an
+`{items}` envelope (using `total` for the heading count when present). It shows
+the full count and the newest three source-linked deliveries: notification
+number linked to `/notifications?record=<id>`, subject, status pill, and created
+time in UTC. Rows that name another document or another source type are
+excluded. Loading, empty, and unavailable states stay inside the card, and
+**View all notifications** opens
+`/notifications?sourceType=DOCUMENT&sourceId=<documentId>`.
+`tests/notifications.spec.js` covers the source query and tenant-only header,
+newest-three ordering and count, record links, the empty and failure states,
+non-blocking loading, refresh, and the filtered queue hand-off.
+
 ## Verification
 
 - Lint and format

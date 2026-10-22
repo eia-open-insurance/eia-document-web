@@ -4,6 +4,7 @@ import { api } from './api.js';
 import ActivityTimeline from './ActivityTimeline.jsx';
 import DocumentContent from './DocumentContent.jsx';
 import EntityPicker from './EntityPicker.jsx';
+import NotificationsPanel from './NotificationsPanel.jsx';
 import {
   MAX_CONTENT_LABEL,
   contentTombstoneAfterDisposition,
@@ -30,6 +31,11 @@ import {
 } from './documentLinks.js';
 import { navigate, recordHref } from './navigation.js';
 import { activityEvents } from './events.js';
+import {
+  documentNotificationCount,
+  documentNotifications,
+  emptyDocumentNotificationsState
+} from './notifications.js';
 import { HOLD_REASON_MAX_LENGTH, retentionView } from './retention.js';
 
 // SPEC 11.6.5 DocumentType.
@@ -76,6 +82,7 @@ const TABS = [
 const EMPTY_FORM = { title: '', documentType: 'POLICY', classification: 'INTERNAL', retentionUntil: '' };
 const EMPTY_LINK_FORM = emptyLinkForm();
 const EMPTY_ACTIVITY = { recordId: '', items: [], loading: false, error: '' };
+const EMPTY_NOTIFICATIONS = emptyDocumentNotificationsState();
 
 function readUrlState() {
   if (typeof window === 'undefined') return { record: '', create: false };
@@ -234,6 +241,8 @@ export default function App() {
   const [removingLinkId, setRemovingLinkId] = useState('');
   const [activity, setActivity] = useState(EMPTY_ACTIVITY);
   const [activityNonce, setActivityNonce] = useState(0);
+  const [notifications, setNotifications] = useState(EMPTY_NOTIFICATIONS);
+  const [notificationsNonce, setNotificationsNonce] = useState(0);
   const [holdOpen, setHoldOpen] = useState(false);
   const [holdReason, setHoldReason] = useState('');
   const [holdBusy, setHoldBusy] = useState(false);
@@ -263,6 +272,13 @@ export default function App() {
     : activity.recordId === selectedDocument.id
       ? activity
       : { recordId: selectedDocument.id, items: [], loading: true, error: '' };
+  // The same containment for the Overview notification card: never show one
+  // document's deliveries under another document's header.
+  const notificationView = !selectedDocument
+    ? EMPTY_NOTIFICATIONS
+    : notifications.recordId === selectedDocument.id
+      ? notifications
+      : { recordId: selectedDocument.id, items: [], count: 0, loading: true, error: '' };
   const linkDefinition = linkTypeDefinition(linkForm.linkedType);
   const linkIsManual = !linkDefinition || linkDefinition.manual;
 
@@ -501,6 +517,52 @@ export default function App() {
     };
   }, [selectedId, activityNonce]);
 
+  /**
+   * Related notifications for the selected document. Notifications are
+   * delivery artifacts owned by the Notifications vertical, so this is a
+   * read-only projection: the fetch starts after the record is selected and
+   * owns its own loading/error state, and a slow or unavailable Notifications
+   * service never blocks or fails the document render.
+   */
+  useEffect(() => {
+    const recordId = selectedId || '';
+    if (!recordId) {
+      setNotifications(EMPTY_NOTIFICATIONS);
+      return undefined;
+    }
+
+    let alive = true;
+    setNotifications({ recordId, items: [], count: 0, loading: true, error: '' });
+
+    api.notifications
+      .list(recordId)
+      .then((payload) => {
+        if (!alive) return;
+        const items = documentNotifications(payload, recordId);
+        setNotifications({
+          recordId,
+          items,
+          count: documentNotificationCount(payload, items),
+          loading: false,
+          error: ''
+        });
+      })
+      .catch((cause) => {
+        if (!alive) return;
+        setNotifications({
+          recordId,
+          items: [],
+          count: 0,
+          loading: false,
+          error: cause.message
+        });
+      });
+
+    return () => {
+      alive = false;
+    };
+  }, [selectedId, notificationsNonce]);
+
   useEffect(() => {
     if (!registerOpen) return undefined;
     const onKeyDown = (event) => {
@@ -578,6 +640,7 @@ export default function App() {
       if (selectedId) {
         setDetailNonce((value) => value + 1);
         setActivityNonce((value) => value + 1);
+        setNotificationsNonce((value) => value + 1);
       }
     } catch (cause) {
       setError(cause.message);
@@ -1196,6 +1259,14 @@ export default function App() {
             </ul>
           )}
         </section>
+
+        <NotificationsPanel
+          documentId={document.id}
+          items={notificationView.items}
+          count={notificationView.count}
+          loading={notificationView.loading}
+          error={notificationView.error}
+        />
       </>
     );
   }

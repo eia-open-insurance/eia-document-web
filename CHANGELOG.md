@@ -8,6 +8,20 @@ The format is based on Keep a Changelog and the project uses Semantic Versioning
 
 ### Added
 
+- Related notifications on the document **Overview**: reads
+  `GET /api/v1/notifications?sourceType=DOCUMENT&sourceId=<documentId>` with
+  `X-EIA-Tenant` and no book header, accepts a bare array or an `{items}`
+  envelope (using `total` for the heading count when present), and renders the
+  full count plus the newest three source-linked deliveries. Each row shows the
+  notification number linked to `/notifications?record=<id>`, subject, status
+  pill, and created time in UTC; rows that name another document or another
+  source type are excluded. Loading, empty, and unavailable states stay
+  card-local and never block the document record, and **View all notifications**
+  opens `/notifications?sourceType=DOCUMENT&sourceId=<documentId>`. Playwright
+  covers the source query and tenant-only header, newest-three ordering and
+  count, unrelated-row exclusion, record links, the envelope total, the empty
+  state, the contained 503, non-blocking loading, refresh, and the filtered
+  queue hand-off.
 - Automatic content tombstone on document disposition: a successful
   `POST /api/v1/documents/{id}/dispose` destroys the stored content on the
   backend, so the workbench now refreshes both the document and
