@@ -81,26 +81,38 @@ async function installContentMock(page, options = {}) {
     versionsStatus = 0,
     versionsError = null,
     versionDownloadStatus = 0,
-    versionDownloadError = null
+    versionDownloadError = null,
+    contentError = null,
+    deleteStatus = 200,
+    deleteError = null,
+    deleteDelay = 0,
+    deleteResponse = null,
+    documentOverrides = {}
   } = options;
 
   const state = {
-    documents: [{ ...DOCUMENT }],
+    documents: [{ ...DOCUMENT, ...documentOverrides }],
     contents: new Map(Object.entries(contents)),
     bytes: new Map(Object.entries(contentBytes)),
     versions: new Map(Object.entries(versions)),
     versionBytes: new Map(Object.entries(versionBytes)),
     requests: [],
+    deletions: [],
     metadataStatus,
     metadataError,
     uploadStatus,
     uploadError,
     contentStatus,
+    contentError,
     uploadDelay,
     versionsStatus,
     versionsError,
     versionDownloadStatus,
-    versionDownloadError
+    versionDownloadError,
+    deleteStatus,
+    deleteError,
+    deleteDelay,
+    deleteResponse
   };
 
   await page.route('**/api/v1/documents**', async (route) => {
@@ -109,7 +121,7 @@ async function installContentMock(page, options = {}) {
     const method = request.method();
     const path = url.pathname;
     const recorded = { method, path, headers: request.headers() };
-    if (method === 'PUT') {
+    if (method === 'PUT' || method === 'DELETE') {
       recorded.body = request.postDataBuffer() || Buffer.alloc(0);
     } else if (method === 'POST') {
       try {
@@ -198,6 +210,13 @@ async function installContentMock(page, options = {}) {
           }
         );
       }
+      const contentMetadata = state.contents.get(versionDownloadMatch[1]);
+      if (contentMetadata && contentMetadata.deleted) {
+        return fulfillJson(410, {
+          code: 'CONTENT_DELETED',
+          message: 'The stored content has been deleted.'
+        });
+      }
       const versionsForDocument = state.versions.get(versionDownloadMatch[1]) || [];
       const entry = versionsForDocument.find(
         (version) => String(version.version) === versionDownloadMatch[2]
@@ -280,15 +299,60 @@ async function installContentMock(page, options = {}) {
       return fulfillJson(201, metadata);
     }
 
+    if (contentMatch && method === 'DELETE') {
+      if (state.deleteDelay) {
+        await new Promise((resolve) => setTimeout(resolve, state.deleteDelay));
+      }
+      if (state.deleteStatus >= 400) {
+        return fulfillJson(
+          state.deleteStatus,
+          state.deleteError || {
+            code: 'CONTENT_DELETE_FAILED',
+            message: 'The stored content could not be deleted.'
+          }
+        );
+      }
+      const existing = state.contents.get(contentMatch[1]);
+      if (!existing) {
+        return fulfillJson(404, {
+          code: 'CONTENT_NOT_FOUND',
+          message: 'No file is stored for this document.'
+        });
+      }
+      const tombstone = {
+        ...existing,
+        deleted: true,
+        deletedAt: '2026-10-21T09:30:00Z',
+        ...(state.deleteResponse || {})
+      };
+      state.contents.set(contentMatch[1], tombstone);
+      state.bytes.delete(contentMatch[1]);
+      state.versionBytes.delete(contentMatch[1]);
+      state.deletions.push(recorded);
+      if (state.deleteStatus === 204) {
+        return route.fulfill({ status: 204 });
+      }
+      return fulfillJson(state.deleteStatus, tombstone);
+    }
+
     if (contentMatch && method === 'GET') {
       if (state.contentStatus >= 400) {
-        return fulfillJson(state.contentStatus, {
-          code: 'CONTENT_READ_FAILED',
-          message: 'The stored file could not be read.'
-        });
+        return fulfillJson(
+          state.contentStatus,
+          state.contentError || {
+            code: 'CONTENT_READ_FAILED',
+            message: 'The stored file could not be read.'
+          }
+        );
       }
       const metadata = state.contents.get(contentMatch[1]);
       const buffer = state.bytes.get(contentMatch[1]);
+      if (metadata && metadata.deleted) {
+        return fulfillJson(410, {
+          code: 'CONTENT_DELETED',
+          message: 'The stored content has been deleted.'
+        });
+      }
       if (!metadata && !buffer) {
         return fulfillJson(404, {
           code: 'CONTENT_NOT_FOUND',
@@ -797,6 +861,233 @@ test('contains version history read errors and retries', async ({ page }) => {
         request.path === `/api/v1/documents/${DOCUMENT_ID}/content/versions`
     )
   ).toHaveLength(2);
+});
+
+test('deletes content after confirmation and renders the retained tombstone', async ({ page }) => {
+  const bytes = Buffer.from('%PDF-1.7 policy schedule to be deleted\n');
+  const state = await installContentMock(page, {
+    contents: { [DOCUMENT_ID]: { ...FILE_METADATA, currentVersion: 3 } },
+    contentBytes: { [DOCUMENT_ID]: bytes },
+    versions: { [DOCUMENT_ID]: FILE_VERSIONS },
+    deleteResponse: {
+      deletedAt: '2026-10-21T09:30:00Z',
+      fileName: 'policy-schedule.pdf'
+    }
+  });
+
+  await page.goto('/');
+  await openFileTab(page);
+
+  const deleteButton = page.getByTestId('delete-content');
+  await expect(deleteButton).toBeEnabled();
+  await expect(page.getByTestId('delete-content-eligibility')).toContainText(
+    'will be destroyed'
+  );
+
+  // Cancelling the irreversible confirmation must not send a command.
+  await deleteButton.click();
+  const dialog = page.getByRole('dialog', { name: 'Delete content' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByTestId('delete-content-warning')).toContainText(
+    'cannot be recovered'
+  );
+  await expect(dialog.getByTestId('delete-file-name')).toHaveText('policy-schedule.pdf');
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await expect(dialog).toBeHidden();
+  expect(state.deletions).toHaveLength(0);
+  await expect(page.getByTestId('file-metadata')).toBeVisible();
+
+  await deleteButton.click();
+  await dialog.getByTestId('confirm-delete-content').click();
+
+  await expect(dialog).toBeHidden();
+  await expect(page.getByTestId('content-deleted')).toBeVisible();
+  await expect(page.getByTestId('content-deleted-badge')).toHaveText('DELETED');
+  await expect(page.getByTestId('delete-notice')).toContainText(
+    `Content deleted from ${DOCUMENT.documentNumber}`
+  );
+  await expect(page.getByTestId('delete-notice')).toContainText('retained as a tombstone');
+
+  // The bytes are gone, but every audit fact that identifies the file stays.
+  await expect(page.getByTestId('content-file-name')).toHaveText('policy-schedule.pdf');
+  await expect(page.getByTestId('content-current-version')).toHaveText('v3');
+  await expect(page.getByTestId('content-file-type')).toHaveText('application/pdf');
+  await expect(page.getByTestId('content-file-size')).toHaveText('1.8 MiB');
+  await expect(page.getByTestId('content-file-sha256')).toHaveText(FILE_METADATA.sha256);
+  await expect(page.getByTestId('content-file-uploaded')).toContainText('Oct 20, 2026');
+  await expect(page.getByTestId('content-deleted-at')).toContainText('Oct 21, 2026');
+
+  await expect(page.getByTestId('download-content')).toBeDisabled();
+  await expect(page.getByTestId('download-disabled-reason')).toContainText(
+    'the content was deleted'
+  );
+  await expect(page.getByTestId('download-version').first()).toBeDisabled();
+  await expect(page.getByTestId('delete-content')).toBeDisabled();
+  await expect(page.getByTestId('delete-content-eligibility')).toContainText(
+    'already been deleted'
+  );
+
+  expect(state.deletions).toHaveLength(1);
+  const deletion = state.deletions[0];
+  expect(deletion.method).toBe('DELETE');
+  expect(deletion.path).toBe(`/api/v1/documents/${DOCUMENT_ID}/content`);
+  expect(deletion.headers['x-eia-tenant']).toBe(TENANT);
+  expect(deletion.body.equals(Buffer.alloc(0))).toBe(true);
+  expect(state.bytes.has(DOCUMENT_ID)).toBe(false);
+  expect(state.contents.get(DOCUMENT_ID).deleted).toBe(true);
+});
+
+test('disables content deletion while a legal hold is active', async ({ page }) => {
+  const state = await installContentMock(page, {
+    contents: { [DOCUMENT_ID]: FILE_METADATA },
+    contentBytes: { [DOCUMENT_ID]: Buffer.from('%PDF-1.7 held policy schedule\n') },
+    documentOverrides: {
+      status: 'ON_HOLD',
+      legalHold: true,
+      legalHoldFlag: true,
+      holdReason: 'Litigation hold — matter 2026-0042',
+      heldAt: '2026-10-21T12:00:00Z'
+    }
+  });
+
+  await page.goto('/');
+  await openFileTab(page);
+
+  const deleteButton = page.getByTestId('delete-content');
+  await expect(deleteButton).toBeDisabled();
+  await expect(deleteButton).toHaveAttribute('title', /Legal hold/);
+  const reason = page.getByTestId('delete-content-eligibility');
+  await expect(reason).toContainText('Legal hold blocks content deletion');
+  await expect(reason).toContainText('matter 2026-0042');
+  await expect(page.getByTestId('delete-content-dialog')).toHaveCount(0);
+  expect(state.deletions).toHaveLength(0);
+});
+
+test('disables content deletion when no content is stored', async ({ page }) => {
+  await installContentMock(page);
+
+  await page.goto('/');
+  await openFileTab(page);
+
+  await expect(page.getByTestId('no-content')).toBeVisible();
+  await expect(page.getByTestId('delete-content')).toBeDisabled();
+  await expect(page.getByTestId('delete-content-eligibility')).toContainText(
+    'No content is stored'
+  );
+});
+
+test('renders an existing tombstone with its deleted date and no download', async ({ page }) => {
+  const state = await installContentMock(page, {
+    contents: {
+      [DOCUMENT_ID]: {
+        ...FILE_METADATA,
+        currentVersion: 3,
+        deleted: true,
+        deletedAt: '2026-10-21T09:30:00Z',
+        exists: false
+      }
+    },
+    versions: { [DOCUMENT_ID]: FILE_VERSIONS }
+  });
+
+  await page.goto('/');
+  await openFileTab(page);
+
+  await expect(page.getByTestId('content-deleted')).toBeVisible();
+  await expect(page.getByTestId('content-deleted-at')).toContainText('Oct 21, 2026');
+  await expect(page.getByTestId('content-file-name')).toHaveText('policy-schedule.pdf');
+  await expect(page.getByTestId('content-file-sha256')).toHaveText(FILE_METADATA.sha256);
+  await expect(page.getByTestId('content-current-version')).toHaveText('v3');
+  await expect(page.getByTestId('download-content')).toBeDisabled();
+  await expect(page.getByTestId('delete-content')).toBeDisabled();
+  await expect(page.getByTestId('delete-content-eligibility')).toContainText(
+    'already been deleted'
+  );
+  expect(state.deletions).toHaveLength(0);
+});
+
+test('treats a 410 download as deleted content', async ({ page }) => {
+  const state = await installContentMock(page, {
+    contents: { [DOCUMENT_ID]: FILE_METADATA },
+    contentBytes: { [DOCUMENT_ID]: Buffer.from('%PDF-1.7 stale schedule\n') },
+    contentStatus: 410,
+    contentError: {
+      code: 'CONTENT_DELETED',
+      message: 'The stored content has been deleted.'
+    }
+  });
+
+  await page.goto('/');
+  await openFileTab(page);
+
+  const download = page.getByTestId('download-content');
+  await expect(download).toBeEnabled();
+  await download.click();
+
+  const failure = page.getByTestId('download-error');
+  await expect(failure).toContainText('CONTENT_DELETED');
+  await expect(failure).toContainText('content was deleted');
+  await expect(page.getByTestId('content-deleted')).toBeVisible();
+  await expect(page.getByTestId('content-deleted-at')).toContainText('2026');
+  await expect(page.getByTestId('download-content')).toBeDisabled();
+  await expect(page.getByTestId('delete-content')).toBeDisabled();
+  expect(state.deletions).toHaveLength(0);
+});
+
+test('keeps the stored content when the delete fails', async ({ page }) => {
+  const bytes = Buffer.from('%PDF-1.7 content that stays\n');
+  const state = await installContentMock(page, {
+    contents: { [DOCUMENT_ID]: FILE_METADATA },
+    contentBytes: { [DOCUMENT_ID]: bytes },
+    deleteStatus: 500,
+    deleteError: {
+      code: 'CONTENT_DELETE_FAILED',
+      message: 'Object storage refused the delete.'
+    }
+  });
+
+  await page.goto('/');
+  await openFileTab(page);
+
+  await page.getByTestId('delete-content').click();
+  const dialog = page.getByRole('dialog', { name: 'Delete content' });
+  await dialog.getByTestId('confirm-delete-content').click();
+
+  const failure = page.getByTestId('delete-content-error');
+  await expect(failure).toContainText('CONTENT_DELETE_FAILED');
+  await expect(failure).toContainText('Object storage refused the delete.');
+  await expect(dialog).toBeVisible();
+  await expect(page.getByTestId('content-deleted')).toHaveCount(0);
+  await expect(page.getByTestId('delete-notice')).toHaveCount(0);
+  await expect(page.getByTestId('file-metadata')).toBeVisible();
+  expect(state.bytes.get(DOCUMENT_ID).equals(bytes)).toBe(true);
+  expect(state.contents.get(DOCUMENT_ID).deleted).toBeUndefined();
+
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await expect(dialog).toBeHidden();
+  await expect(page.getByTestId('delete-content')).toBeEnabled();
+});
+
+test('accepts a 204 delete response and keeps the audit projection', async ({ page }) => {
+  await installContentMock(page, {
+    contents: { [DOCUMENT_ID]: FILE_METADATA },
+    contentBytes: { [DOCUMENT_ID]: Buffer.from('%PDF-1.7 204 schedule\n') },
+    deleteStatus: 204
+  });
+
+  await page.goto('/');
+  await openFileTab(page);
+
+  await page.getByTestId('delete-content').click();
+  await page
+    .getByRole('dialog', { name: 'Delete content' })
+    .getByTestId('confirm-delete-content')
+    .click();
+
+  await expect(page.getByTestId('content-deleted')).toBeVisible();
+  await expect(page.getByTestId('content-file-name')).toHaveText('policy-schedule.pdf');
+  await expect(page.getByTestId('content-file-sha256')).toHaveText(FILE_METADATA.sha256);
+  await expect(page.getByTestId('content-deleted-at')).not.toHaveText('—');
 });
 
 test('contains a failed version download', async ({ page }) => {

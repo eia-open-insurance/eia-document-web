@@ -4,9 +4,11 @@
  * A document has one metadata record (the source of truth) and, optionally,
  * stored content: the evidence file itself. Content is uploaded as raw bytes
  * to `PUT /api/v1/documents/{id}/content` and read back as a blob from
- * `GET /api/v1/documents/{id}/content`. These helpers keep the client-side
- * rules (the 10 MiB ceiling), the metadata projection, and the download
- * mechanics in one place so the view stays declarative.
+ * `GET /api/v1/documents/{id}/content`. `DELETE` on the same path removes the
+ * bytes permanently but keeps a tombstone: the file name, digest, size, and
+ * version audit stay attached to the document. These helpers keep the
+ * client-side rules (the 10 MiB ceiling), the metadata projection, and the
+ * download mechanics in one place so the view stays declarative.
  */
 
 /** The Document API's content ceiling; the backend enforces the same limit. */
@@ -94,6 +96,15 @@ function firstValue(...values) {
   return '';
 }
 
+/** True when any representative of a deleted flag is affirmative. */
+function anyTrue(...values) {
+  return values.some((value) => {
+    if (value === true) return true;
+    if (typeof value !== 'string') return false;
+    return ['true', 'yes', 'y', '1', 'deleted', 'tombstoned'].includes(value.trim().toLowerCase());
+  });
+}
+
 function normalizeSha256(value) {
   const text = String(value || '').trim();
   return text.replace(/^sha256:/i, '').trim();
@@ -107,11 +118,45 @@ function normalizeSha256(value) {
  */
 export function normalizeContentMetadata(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
-  if (body.exists === false || body.stored === false) return null;
 
   const record = body.content && typeof body.content === 'object' && !Array.isArray(body.content)
     ? body.content
     : body;
+
+  // A tombstone is content metadata too: the bytes are gone, but the file name,
+  // digest, size, and version remain auditable. Read the deletion facts before
+  // the "no content" shortcuts so a deleted document never becomes an empty
+  // state that looks like nothing was ever stored.
+  const deletedAt = firstText(
+    record.deletedAt,
+    record.deleted_at,
+    record.contentDeletedAt,
+    record.content_deleted_at,
+    record.tombstonedAt,
+    record.tombstoned_at,
+    record.removedAt,
+    record.removed_at,
+    body.deletedAt,
+    body.deleted_at,
+    body.contentDeletedAt,
+    body.content_deleted_at
+  );
+  const deleted = anyTrue(
+    record.deleted,
+    record.contentDeleted,
+    record.content_deleted,
+    record.tombstoned,
+    record.isDeleted,
+    record.is_deleted,
+    body.deleted,
+    body.contentDeleted,
+    body.content_deleted,
+    body.tombstoned,
+    body.isDeleted,
+    body.is_deleted
+  ) || Boolean(deletedAt);
+
+  if (!deleted && (body.exists === false || body.stored === false)) return null;
 
   const fileName = firstText(
     record.fileName,
@@ -169,9 +214,9 @@ export function normalizeContentMetadata(body) {
     record.revision
   );
 
-  if (!fileName && sizeBytes === null && !sha256 && !uploadedAt) return null;
+  if (!deleted && !fileName && sizeBytes === null && !sha256 && !uploadedAt) return null;
   // A zero-valued projection ("no file yet") is an empty state, not content.
-  if (!fileName && !sha256 && !uploadedAt && sizeBytes === 0) return null;
+  if (!deleted && !fileName && !sha256 && !uploadedAt && sizeBytes === 0) return null;
 
   return {
     fileName,
@@ -179,7 +224,35 @@ export function normalizeContentMetadata(body) {
     sizeBytes,
     sha256,
     uploadedAt,
-    currentVersion
+    currentVersion,
+    deleted,
+    deletedAt
+  };
+}
+
+/** True when the metadata describes a tombstone rather than stored bytes. */
+export function isContentDeleted(metadata) {
+  return Boolean(metadata && (metadata.deleted || metadata.deletedAt));
+}
+
+/**
+ * Completes a tombstone from the metadata already on screen. A 204 delete has
+ * no body, and a sparse delete response may omit some audit fields; the bytes
+ * are gone either way, so the previous projection is retained and only the
+ * deletion facts are applied.
+ */
+export function markContentDeleted(metadata, deletedAt = '') {
+  const base = metadata && typeof metadata === 'object' ? metadata : {};
+  return {
+    fileName: '',
+    contentType: '',
+    sizeBytes: null,
+    sha256: '',
+    uploadedAt: '',
+    currentVersion: null,
+    ...base,
+    deleted: true,
+    deletedAt: firstText(deletedAt, base.deletedAt) || new Date().toISOString()
   };
 }
 

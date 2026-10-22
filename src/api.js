@@ -204,6 +204,26 @@ export const api = {
     /** Reads the stored bytes as a blob for an authorized client download. */
     download: (documentId) => downloadBlob(contentPath(documentId)),
     /**
+     * Permanently deletes the stored bytes. The document and its content
+     * tombstone — file name, digest, size, and version audit — are retained;
+     * the API answers with the tombstone, or 204 when it has none to return.
+     * A legal hold blocks the delete, so the caller surfaces that failure
+     * rather than treating the content as gone.
+     */
+    remove: async (documentId) => {
+      const response = await fetch(contentPath(documentId), {
+        method: 'DELETE',
+        cache: 'no-store',
+        headers: { 'X-EIA-Tenant': TENANT }
+      });
+      if (!response.ok) {
+        throw new ApiError(await readError(response), response.status);
+      }
+      if (response.status === 204) return null;
+      const text = await response.text();
+      return text ? parseJson(text) : null;
+    },
+    /**
      * Immutable content revisions, newest first. The API returns a plain array
      * of revision metadata; an older deployment without the route, or a
      * document whose content predates revision history, reads as no history

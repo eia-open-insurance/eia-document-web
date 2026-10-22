@@ -1583,7 +1583,10 @@ export default function App() {
             key={selectedDocument.id}
             documentId={selectedDocument.id}
             documentNumber={selectedDocument.documentNumber}
+            legalHold={Boolean(selectedRetention?.hold.held)}
+            legalHoldReason={selectedRetention?.hold.reason || ''}
             onUploaded={() => setActivityNonce((value) => value + 1)}
+            onDeleted={() => setActivityNonce((value) => value + 1)}
           />
         );
       case 'lifecycle':
