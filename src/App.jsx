@@ -4,7 +4,13 @@ import { api } from './api.js';
 import ActivityTimeline from './ActivityTimeline.jsx';
 import DocumentContent from './DocumentContent.jsx';
 import EntityPicker from './EntityPicker.jsx';
-import { MAX_CONTENT_LABEL, formatBytes, validateContentFile } from './documentContent.js';
+import {
+  MAX_CONTENT_LABEL,
+  contentTombstoneAfterDisposition,
+  formatBytes,
+  normalizeContentMetadata,
+  validateContentFile
+} from './documentContent.js';
 import {
   LINK_REFERENCE_MAX_LENGTH,
   LINK_TYPES,
@@ -235,6 +241,9 @@ export default function App() {
   const [disposeOpen, setDisposeOpen] = useState(false);
   const [disposeBusy, setDisposeBusy] = useState(false);
   const [disposeError, setDisposeError] = useState('');
+  // Content tombstones written by a disposition, keyed by document id. They
+  // let the File tab render the destroyed content before its own read settles.
+  const [contentSnapshots, setContentSnapshots] = useState({});
 
   const documentsRef = useRef([]);
   const registerOpenRef = useRef(false);
@@ -243,6 +252,9 @@ export default function App() {
 
   const selectedDocument = documents.find((document) => document.id === selectedId) || null;
   const selectedRetention = selectedDocument ? retentionView(selectedDocument) : null;
+  const selectedContentSnapshot = selectedDocument
+    ? contentSnapshots[selectedDocument.id] || null
+    : null;
   const filteredDocuments = filterDocuments(documents, queueFilter);
   // Never show one document's events under another document's header while a
   // selection change is still in flight.
@@ -763,6 +775,42 @@ export default function App() {
     );
   }
 
+  /**
+   * Refreshes both projections after a disposition. The backend tombstones the
+   * stored content as part of the command, so this read is what lets the File
+   * tab show the destroyed file (or the no-content state) without a page
+   * reload. A metadata read that still reports the pre-disposition file is
+   * completed as a tombstone; a 404 means nothing was ever stored and must stay
+   * the empty state rather than inventing a tombstone.
+   */
+  async function refreshDisposedContent(documentId, disposedAt) {
+    const [documentResult, contentResult] = await Promise.allSettled([
+      api.documents.get(documentId),
+      api.content.metadata(documentId)
+    ]);
+
+    if (documentResult.status === 'fulfilled' && documentResult.value?.id === documentId) {
+      applyDocumentUpdate(documentId, documentResult.value, {
+        status: 'DISPOSED',
+        disposed: true,
+        disposedAt
+      });
+    }
+
+    if (contentResult.status !== 'fulfilled') return;
+
+    setContentSnapshots((current) => ({
+      ...current,
+      [documentId]: {
+        key: (current[documentId]?.key || 0) + 1,
+        metadata: contentTombstoneAfterDisposition(
+          normalizeContentMetadata(contentResult.value),
+          disposedAt
+        )
+      }
+    }));
+  }
+
   function openHoldDialog() {
     if (!selectedDocument || !selectedRetention?.canPlaceHold) return;
     setHoldReason('');
@@ -859,6 +907,18 @@ export default function App() {
   async function confirmDispose() {
     if (disposeBusy || !selectedDocument) return;
     const document = selectedDocument;
+    const disposedAt = new Date().toISOString();
+    const fallback = {
+      status: 'DISPOSED',
+      disposedAt,
+      disposed: true,
+      legalHold: false,
+      legalHoldFlag: false,
+      hold: null,
+      holdReason: null,
+      heldAt: null,
+      statusBeforeHold: null
+    };
 
     setDisposeBusy(true);
     setDisposeError('');
@@ -866,20 +926,19 @@ export default function App() {
     setNotice('');
     try {
       const updated = await api.documents.dispose(document.id);
-      applyDocumentUpdate(document.id, updated, {
-        status: 'DISPOSED',
-        disposedAt: new Date().toISOString(),
-        disposed: true,
-        legalHold: false,
-        legalHoldFlag: false,
-        hold: null,
-        holdReason: null,
-        heldAt: null,
-        statusBeforeHold: null
-      });
+      applyDocumentUpdate(document.id, updated, fallback);
+      // Disposition also tombstones the stored content. Read both projections
+      // now so the File tab is ready with the tombstone (or the empty state)
+      // before the user leaves the Retention tab. A refresh failure never
+      // changes the successful command's outcome.
+      try {
+        await refreshDisposedContent(document.id, disposedAt);
+      } catch (ignored) {
+        // The command succeeded; the File tab can retry its own read.
+      }
       setDisposeOpen(false);
       setNotice(
-        `Document ${document.documentNumber} disposed. The audit trail and disposition certificate are retained.`
+        `Document ${document.documentNumber} disposed. The stored content was destroyed; the content tombstone, audit trail, and disposition certificate are retained.`
       );
       setActivityNonce((value) => value + 1);
     } catch (cause) {
@@ -1215,6 +1274,20 @@ export default function App() {
           </section>
         </div>
 
+        <section
+          className="eia-context-panel"
+          aria-label="Disposition and stored content"
+          data-testid="lifecycle-disposition-note"
+          style={{ marginTop: 14 }}
+        >
+          <h4>Disposition and stored content</h4>
+          <p>
+            {document.status === 'DISPOSED'
+              ? 'This document has been disposed. Its stored content was destroyed automatically; the File tab retains the content tombstone (file name, hash, size, and versions). The document metadata, audit trail, and disposition certificate are retained, and no separate content deletion is required.'
+              : 'Disposition is terminal and destroys the stored evidence content. The file name, hash, size, and version audit remain as a content tombstone, while the document metadata, audit trail, and disposition certificate are retained. No separate content deletion is required.'}
+          </p>
+        </section>
+
         <div className="eia-section-title">
           <h2>Permitted transitions</h2>
           <span className="eia-muted">{targets.length}</span>
@@ -1262,7 +1335,7 @@ export default function App() {
         ? 'No legal hold is active. A hold suspends disposition until it is released.'
         : view.holdBlock;
     const disposeNote = view.canDispose
-      ? 'The retention date has been reached and no legal hold applies. Disposition is irreversible: the stored content is destroyed while the audit trail and disposition certificate are retained.'
+      ? 'The retention date has been reached and no legal hold applies. Disposition is irreversible: the stored content is destroyed automatically, leaving only a retained tombstone (file name, hash, size, and versions); the document metadata, audit trail, and disposition certificate are retained. No separate content deletion is required.'
       : view.disposeBlock;
     const busy = holdBusy || disposeBusy;
 
@@ -1412,6 +1485,12 @@ export default function App() {
               </dd>
               <dt>Audit trail</dt>
               <dd>Retained after disposition</dd>
+              <dt>Stored content</dt>
+              <dd data-testid="disposition-content">
+                {disposition.disposed
+                  ? 'Destroyed automatically; tombstone retained'
+                  : 'Destroyed automatically on disposition'}
+              </dd>
             </dl>
             <div className="eia-actions" style={{ marginTop: 12, justifyContent: 'flex-start' }}>
               <button
@@ -1446,8 +1525,10 @@ export default function App() {
           <h4>Why this matters</h4>
           <p>
             A legal hold blocks disposition: a held record cannot be disposed or archived out of
-            retrievability. Disposition is irreversible: the stored content is destroyed, while the
-            document tombstone, audit trail, and disposition certificate are retained.
+            retrievability. Disposition is irreversible: the stored content is destroyed
+            automatically, while the content tombstone (file name, hash, size, and versions),
+            document metadata, audit trail, and disposition certificate are retained. No separate
+            content deletion is required.
           </p>
         </section>
       </>
@@ -1585,6 +1666,9 @@ export default function App() {
             documentNumber={selectedDocument.documentNumber}
             legalHold={Boolean(selectedRetention?.hold.held)}
             legalHoldReason={selectedRetention?.hold.reason || ''}
+            disposed={Boolean(selectedRetention?.disposition.disposed)}
+            disposedAt={selectedRetention?.disposition.disposedAt || ''}
+            contentSnapshot={selectedContentSnapshot}
             onUploaded={() => setActivityNonce((value) => value + 1)}
             onDeleted={() => setActivityNonce((value) => value + 1)}
           />
@@ -2225,8 +2309,10 @@ export default function App() {
             >
               <h4 style={{ color: 'var(--eia-red)' }}>Disposition is irreversible</h4>
               <p>
-                The stored content is destroyed. The document tombstone, audit trail, and disposition
-                certificate are retained. A disposed record cannot be held, restored, or disposed again.
+                The stored content is destroyed automatically; its file name, hash, size, and
+                version remain as a content tombstone. The document metadata, audit trail, and
+                disposition certificate are retained. No separate content deletion is required. A
+                disposed record cannot be held, restored, or disposed again.
               </p>
             </div>
 

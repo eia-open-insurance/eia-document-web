@@ -6,9 +6,10 @@
  * to `PUT /api/v1/documents/{id}/content` and read back as a blob from
  * `GET /api/v1/documents/{id}/content`. `DELETE` on the same path removes the
  * bytes permanently but keeps a tombstone: the file name, digest, size, and
- * version audit stay attached to the document. These helpers keep the
- * client-side rules (the 10 MiB ceiling), the metadata projection, and the
- * download mechanics in one place so the view stays declarative.
+ * version audit stay attached to the document. Disposing the document destroys
+ * the stored content the same way, without a separate delete. These helpers
+ * keep the client-side rules (the 10 MiB ceiling), the metadata projection, and
+ * the download mechanics in one place so the view stays declarative.
  */
 
 /** The Document API's content ceiling; the backend enforces the same limit. */
@@ -254,6 +255,19 @@ export function markContentDeleted(metadata, deletedAt = '') {
     deleted: true,
     deletedAt: firstText(deletedAt, base.deletedAt) || new Date().toISOString()
   };
+}
+
+/**
+ * Reads content metadata after a document disposition. Disposition destroys the
+ * stored bytes on the server, so the only truthful client projection is the
+ * tombstone: the file name, hash, size, upload time, and version remain
+ * auditable. A content read that still describes the pre-disposition file (a
+ * lagging projection) is completed from the disposition time, and a document
+ * that never stored content stays null rather than inventing a tombstone.
+ */
+export function contentTombstoneAfterDisposition(metadata, disposedAt = '') {
+  if (!metadata) return null;
+  return markContentDeleted(metadata, metadata.deletedAt || disposedAt);
 }
 
 /**

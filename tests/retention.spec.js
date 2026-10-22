@@ -5,6 +5,18 @@ const DOCUMENT_ID = '0192f3a4-5b1c-7e2d-9a3f-6c8d1e0b4a72';
 const HOLD_PATH = `/api/v1/documents/${DOCUMENT_ID}/hold`;
 const RELEASE_PATH = `${HOLD_PATH}/release`;
 const DISPOSE_PATH = `/api/v1/documents/${DOCUMENT_ID}/dispose`;
+const CONTENT_PATH = `/api/v1/documents/${DOCUMENT_ID}/content`;
+const CONTENT_METADATA_PATH = `${CONTENT_PATH}/metadata`;
+
+const FILE_METADATA = {
+  documentId: DOCUMENT_ID,
+  fileName: 'policy-schedule.pdf',
+  contentType: 'application/pdf',
+  sizeBytes: 1843200,
+  sha256: '9f2c0f4d3a8e7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c',
+  uploadedAt: '2026-10-20T15:04:00Z',
+  currentVersion: 3
+};
 
 function document(overrides = {}) {
   return {
@@ -30,12 +42,20 @@ function document(overrides = {}) {
  * list/get plus place-hold, release-hold, and dispose. Each command mutates the
  * stored record and answers with the updated document, which is the shape the
  * workbench folds back into the queue.
+ *
+ * `options.content` seeds the stored file. Disposition tombstones it, the way
+ * the backend does; `options.keepContentOnDispose` leaves the metadata read
+ * behind (still reporting the file) so the workbench's own tombstone handling
+ * can be exercised.
  */
-async function installRetentionMock(page, overrides = {}) {
+async function installRetentionMock(page, overrides = {}, options = {}) {
+  const { content = null, keepContentOnDispose = false, metadataStatus = 0 } = options;
   const state = {
     doc: document(overrides),
+    contents: new Map(content ? [[DOCUMENT_ID, { ...content }]] : []),
     requests: [],
-    failures: { hold: false, release: false, dispose: false }
+    failures: { hold: false, release: false, dispose: false },
+    metadataStatus
   };
 
   await page.route('**/api/v1/events/aggregate/**', (route) =>
@@ -119,6 +139,15 @@ async function installRetentionMock(page, overrides = {}) {
           message: 'The document cannot be disposed while a legal hold is active.'
         });
       }
+      // Disposition destroys the stored content: the pointer keeps its audit
+      // facts and gains the tombstone timestamp.
+      if (state.contents.has(DOCUMENT_ID) && !keepContentOnDispose) {
+        state.contents.set(DOCUMENT_ID, {
+          ...state.contents.get(DOCUMENT_ID),
+          deleted: true,
+          deletedAt: '2026-10-21T19:00:00Z'
+        });
+      }
       state.doc = {
         ...state.doc,
         status: 'DISPOSED',
@@ -131,6 +160,47 @@ async function installRetentionMock(page, overrides = {}) {
         updatedAt: '2026-10-21T19:00:00Z'
       };
       return fulfill(200, state.doc);
+    }
+
+    if (path === CONTENT_METADATA_PATH && method === 'GET') {
+      if (state.metadataStatus) {
+        return fulfill(state.metadataStatus, {
+          code: 'CONTENT_METADATA_UNAVAILABLE',
+          message: 'File metadata is temporarily unavailable.'
+        });
+      }
+      const metadata = state.contents.get(DOCUMENT_ID);
+      return metadata
+        ? fulfill(200, metadata)
+        : fulfill(404, {
+            code: 'CONTENT_NOT_FOUND',
+            message: 'No file is stored for this document.'
+          });
+    }
+
+    if (path === `${CONTENT_PATH}/versions` && method === 'GET') {
+      return fulfill(200, []);
+    }
+
+    if (path === CONTENT_PATH && method === 'GET') {
+      const metadata = state.contents.get(DOCUMENT_ID);
+      if (metadata?.deleted) {
+        return fulfill(410, {
+          code: 'CONTENT_DELETED',
+          message: 'The stored content has been deleted.'
+        });
+      }
+      return fulfill(404, {
+        code: 'CONTENT_NOT_FOUND',
+        message: 'No file is stored for this document.'
+      });
+    }
+
+    if (path === CONTENT_PATH && method === 'DELETE') {
+      return fulfill(409, {
+        code: 'CONTENT_ALREADY_DELETED',
+        message: 'No separate content delete is expected after disposition.'
+      });
     }
 
     const detailMatch = path.match(/^\/api\/v1\/documents\/([^/]+)$/);
@@ -261,7 +331,9 @@ test('disposes only after an explicit red confirmation and retains the audit con
   await expect(page.getByTestId('disposition-eligibility')).toContainText('audit trail');
   await expect(page.getByTestId('hold-eligibility')).toContainText('disposed record cannot be placed');
   await expect(
-    page.getByText('Document DOC-2026-0000001 disposed. The audit trail and disposition certificate are retained.')
+    page.getByText(
+      'Document DOC-2026-0000001 disposed. The stored content was destroyed; the content tombstone, audit trail, and disposition certificate are retained.'
+    )
   ).toBeVisible();
   expect(state.doc.status).toBe('DISPOSED');
   expect(state.requests.some((request) => request.path === DISPOSE_PATH)).toBe(true);
@@ -364,4 +436,144 @@ test('surfaces a dispose rejection without disposing the record', async ({ page 
   await expect(page.getByTestId('record-status')).toHaveText('ACTIVE');
   await expect(page.getByTestId('disposition-date')).toHaveText('—');
   expect(state.doc.status).toBe('ACTIVE');
+});
+
+test('dispose tombstones stored content and the File tab shows it without a separate delete', async ({ page }) => {
+  const state = await installRetentionMock(page, {}, { content: FILE_METADATA });
+
+  await page.goto('/');
+  await page.getByRole('tab', { name: 'Retention' }).click();
+  await expect(page.getByTestId('disposition-content')).toContainText(
+    'Destroyed automatically on disposition'
+  );
+  await page.getByTestId('dispose-document').click();
+  await page
+    .getByRole('dialog', { name: 'Dispose document' })
+    .getByTestId('confirm-dispose')
+    .click();
+
+  await expect(page.getByRole('dialog', { name: 'Dispose document' })).toBeHidden();
+  await expect(page.getByTestId('disposition-status')).toHaveText('DISPOSED');
+  await expect(page.getByTestId('disposition-content')).toContainText(
+    'Destroyed automatically; tombstone retained'
+  );
+  await expect(page.getByTestId('retention-context')).toContainText('content tombstone');
+  await expect(page.getByTestId('retention-context')).toContainText(
+    'No separate content deletion is required'
+  );
+  await expect(page.getByTestId('disposition-eligibility')).toContainText(
+    'stored content was destroyed'
+  );
+
+  // The successful command refreshes both projections before the tab changes.
+  const disposeIndex = state.requests.findIndex(
+    (request) => request.method === 'POST' && request.path === DISPOSE_PATH
+  );
+  expect(disposeIndex).toBeGreaterThanOrEqual(0);
+  expect(
+    state.requests.filter(
+      (request, index) =>
+        index > disposeIndex &&
+        request.method === 'GET' &&
+        request.path === CONTENT_METADATA_PATH
+    ).length
+  ).toBeGreaterThan(0);
+  expect(
+    state.requests.filter(
+      (request, index) =>
+        index > disposeIndex &&
+        request.method === 'GET' &&
+        request.path === `/api/v1/documents/${DOCUMENT_ID}`
+    ).length
+  ).toBeGreaterThan(0);
+  expect(state.contents.get(DOCUMENT_ID).deleted).toBe(true);
+
+  await page.getByRole('tab', { name: 'Lifecycle' }).click();
+  await expect(page.getByTestId('lifecycle-disposition-note')).toContainText(
+    'stored content was destroyed automatically'
+  );
+  await expect(page.getByTestId('lifecycle-disposition-note')).toContainText(
+    'no separate content deletion is required'
+  );
+
+  await page.getByRole('tab', { name: 'File' }).click();
+  await expect(page.getByTestId('content-deleted')).toBeVisible();
+  await expect(page.getByTestId('content-deleted-badge')).toHaveText('DELETED');
+  await expect(page.getByTestId('content-deleted-warning')).toContainText(
+    'Disposition destroyed the stored bytes automatically'
+  );
+  await expect(page.getByTestId('content-deleted-warning')).toContainText(
+    'No separate content deletion is required'
+  );
+  await expect(page.getByTestId('content-file-name')).toHaveText('policy-schedule.pdf');
+  await expect(page.getByTestId('content-current-version')).toHaveText('v3');
+  await expect(page.getByTestId('content-file-type')).toHaveText('application/pdf');
+  await expect(page.getByTestId('content-file-size')).toHaveText('1.8 MiB');
+  await expect(page.getByTestId('content-file-sha256')).toHaveText(FILE_METADATA.sha256);
+  await expect(page.getByTestId('content-deleted-at')).toContainText('Oct 21, 2026');
+  await expect(page.getByTestId('download-content')).toBeDisabled();
+  await expect(page.getByTestId('delete-content')).toBeDisabled();
+  await expect(page.getByTestId('delete-content-eligibility')).toContainText(
+    'No separate content deletion is required'
+  );
+  await expect(page.getByTestId('version-history')).toBeVisible();
+
+  // Disposition tombstoned the content; no second DELETE command was needed.
+  expect(state.requests.filter((request) => request.method === 'DELETE')).toHaveLength(0);
+});
+
+test('dispose leaves the File tab empty when no content was ever stored', async ({ page }) => {
+  const state = await installRetentionMock(page);
+
+  await page.goto('/');
+  await page.getByRole('tab', { name: 'Retention' }).click();
+  await page.getByTestId('dispose-document').click();
+  await page
+    .getByRole('dialog', { name: 'Dispose document' })
+    .getByTestId('confirm-dispose')
+    .click();
+
+  await expect(page.getByRole('dialog', { name: 'Dispose document' })).toBeHidden();
+  await page.getByRole('tab', { name: 'File' }).click();
+
+  const empty = page.getByTestId('no-content');
+  await expect(empty).toContainText('No file stored');
+  await expect(empty).toContainText('has been disposed');
+  await expect(empty).toContainText('no replacement file is offered');
+  await expect(page.getByTestId('content-deleted')).toHaveCount(0);
+  await expect(page.getByLabel('File to upload')).toHaveCount(0);
+  await expect(page.getByTestId('delete-content')).toBeDisabled();
+  await expect(page.getByTestId('delete-content-eligibility')).toContainText(
+    'nothing to delete'
+  );
+  expect(state.contents.size).toBe(0);
+  expect(state.requests.filter((request) => request.method === 'DELETE')).toHaveLength(0);
+});
+
+test('dispose still shows the tombstone when the content metadata read lags', async ({ page }) => {
+  const state = await installRetentionMock(
+    page,
+    {},
+    { content: FILE_METADATA, keepContentOnDispose: true }
+  );
+
+  await page.goto('/');
+  await page.getByRole('tab', { name: 'Retention' }).click();
+  await page.getByTestId('dispose-document').click();
+  await page
+    .getByRole('dialog', { name: 'Dispose document' })
+    .getByTestId('confirm-dispose')
+    .click();
+
+  await expect(page.getByRole('dialog', { name: 'Dispose document' })).toBeHidden();
+  // The mock still reports the pre-disposition file: the disposition fact wins.
+  expect(state.contents.get(DOCUMENT_ID).deleted).toBeUndefined();
+
+  await page.getByRole('tab', { name: 'File' }).click();
+  await expect(page.getByTestId('content-deleted')).toBeVisible();
+  await expect(page.getByTestId('content-file-name')).toHaveText('policy-schedule.pdf');
+  await expect(page.getByTestId('content-file-sha256')).toHaveText(FILE_METADATA.sha256);
+  await expect(page.getByTestId('download-content')).toBeDisabled();
+  await expect(page.getByTestId('delete-content')).toBeDisabled();
+  expect(state.requests.filter((request) => request.method === 'DELETE')).toHaveLength(0);
 });

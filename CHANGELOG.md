@@ -8,6 +8,18 @@ The format is based on Keep a Changelog and the project uses Semantic Versioning
 
 ### Added
 
+- Automatic content tombstone on document disposition: a successful
+  `POST /api/v1/documents/{id}/dispose` destroys the stored content on the
+  backend, so the workbench now refreshes both the document and
+  `GET /api/v1/documents/{id}/content/metadata` after the command. The **File**
+  tab shows the retained content tombstone immediately (file name, hash, size,
+  version, and deleted time) with downloads and content deletion disabled; a
+  disposition that had no stored content stays in the "No file stored" empty
+  state with no replacement upload, and no separate content `DELETE` is needed.
+  The Lifecycle and Retention tabs state that disposition destroys the stored
+  content while retaining the content and document audit metadata. Playwright
+  covers the post-dispose metadata refetch, the tombstone, the no-content case,
+  and a lagging metadata projection.
 - Repository baseline.
 - Document association links: the Associations tab lists linked records with type, reference,
   added date, and a shell route to the owning vertical. The add-link dialog uses a predictive

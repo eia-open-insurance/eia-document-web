@@ -249,7 +249,8 @@ export function retentionView(document = {}, now = new Date()) {
 
   let disposeBlock = '';
   if (disposition.disposed) {
-    disposeBlock = 'This document has already been disposed. Disposition is irreversible; the audit trail and disposition certificate are retained.';
+    disposeBlock =
+      'This document has already been disposed. Disposition is irreversible; the stored content was destroyed and its tombstone, the audit trail, and the disposition certificate are retained.';
   } else if (hold.held) {
     disposeBlock = 'Legal hold blocks disposition. Release the hold before disposing this record.';
   } else if (!retentionUntil) {

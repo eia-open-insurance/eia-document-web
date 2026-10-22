@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { api } from './api.js';
 import {
   MAX_CONTENT_LABEL,
+  contentTombstoneAfterDisposition,
   formatBytes,
   isContentDeleted,
   markContentDeleted,
@@ -19,6 +20,17 @@ const EMPTY_UPLOAD = { busy: false, progress: null, error: '', notice: '' };
 const EMPTY_DOWNLOAD = { busy: false, error: '', notice: '' };
 const EMPTY_VERSION_DOWNLOAD = { busy: null, error: '', notice: '' };
 const EMPTY_DELETE = { open: false, busy: false, error: '' };
+
+/**
+ * A snapshot written by the workbench after a disposition. The API has already
+ * destroyed the bytes, so seeding from it lets the File tab render the
+ * tombstone before the tab's own metadata read completes. `metadata: null`
+ * means the disposition confirmed there was no stored content to tombstone.
+ */
+function contentStateFromSnapshot(snapshot) {
+  if (!snapshot) return EMPTY_CONTENT;
+  return { loading: false, metadata: snapshot.metadata || null, error: '' };
+}
 
 const DELETE_OVERLAY_STYLE = {
   position: 'fixed',
@@ -95,10 +107,13 @@ export default function DocumentContent({
   documentNumber,
   legalHold = false,
   legalHoldReason = '',
+  disposed = false,
+  disposedAt = '',
+  contentSnapshot = null,
   onUploaded,
   onDeleted
 }) {
-  const [content, setContent] = useState(EMPTY_CONTENT);
+  const [content, setContent] = useState(() => contentStateFromSnapshot(contentSnapshot));
   const [versionHistory, setVersionHistory] = useState(EMPTY_VERSION_HISTORY);
   const [reload, setReload] = useState(0);
   const [pendingFile, setPendingFile] = useState(null);
@@ -111,6 +126,7 @@ export default function DocumentContent({
   const [versionUploadOpen, setVersionUploadOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
   const mountedRef = useRef(true);
+  const snapshotKey = contentSnapshot ? contentSnapshot.key : 0;
 
   useEffect(() => {
     mountedRef.current = true;
@@ -131,6 +147,13 @@ export default function DocumentContent({
   }, [deletion.open, deletion.busy]);
 
   useEffect(() => {
+    // The disposition refresh can land after the tab is already open. Seed the
+    // tombstone immediately instead of waiting for the metadata read below.
+    if (!contentSnapshot) return;
+    setContent({ loading: false, metadata: contentSnapshot.metadata || null, error: '' });
+  }, [contentSnapshot]);
+
+  useEffect(() => {
     let alive = true;
     setContent((current) => ({ ...current, loading: true, error: '' }));
     setVersionHistory((current) => ({ ...current, loading: true, error: '' }));
@@ -139,7 +162,15 @@ export default function DocumentContent({
       .metadata(documentId)
       .then((body) => {
         if (!alive) return;
-        setContent({ loading: false, metadata: normalizeContentMetadata(body), error: '' });
+        const normalized = normalizeContentMetadata(body);
+        // Disposition destroys the stored bytes. If the metadata projection is
+        // ahead of the tombstone (or an older deployment still reports the
+        // file), the disposition fact still wins: there is nothing to download.
+        setContent({
+          loading: false,
+          metadata: disposed ? contentTombstoneAfterDisposition(normalized, disposedAt) : normalized,
+          error: ''
+        });
       })
       .catch((cause) => {
         if (!alive) return;
@@ -166,9 +197,14 @@ export default function DocumentContent({
     return () => {
       alive = false;
     };
-  }, [documentId, reload]);
+  }, [documentId, reload, snapshotKey, disposed, disposedAt]);
 
-  const metadata = content.metadata;
+  // A disposed document cannot have live content: disposition destroyed the
+  // bytes. Computing the tombstone at render time also covers a stale metadata
+  // projection from a lagging read.
+  const metadata = disposed
+    ? contentTombstoneAfterDisposition(content.metadata, disposedAt)
+    : content.metadata;
   const deleted = isContentDeleted(metadata);
   const historyAvailable = !versionHistory.loading && !versionHistory.error;
   const currentVersion = resolveCurrentContentVersion(
@@ -180,17 +216,21 @@ export default function DocumentContent({
 
   // Deletion is a destructive content command, not a document disposition.
   // The tombstone stays readable forever; each condition that disables the
-  // command is explained beside the button.
+  // command is explained beside the button. A disposed record needs no delete:
+  // the backend destroyed the content as part of disposition.
   let deleteBlock = '';
   if (deleted) {
-    deleteBlock =
-      'The stored content has already been deleted. The bytes are gone; the file name, hash, size, and version audit remain as a tombstone.';
+    deleteBlock = disposed
+      ? 'Disposition destroyed the stored content, and this tombstone is retained for audit. No separate content deletion is required.'
+      : 'The stored content has already been deleted. The bytes are gone; the file name, hash, size, and version audit remain as a tombstone.';
   } else if (legalHold) {
     deleteBlock = `Legal hold blocks content deletion.${
       legalHoldReason ? ` Hold reason: ${legalHoldReason}.` : ''
     } Release the hold before deleting this file.`;
   } else if (!metadata) {
-    deleteBlock = 'No content is stored for this document, so there is nothing to delete.';
+    deleteBlock = disposed
+      ? 'This document has been disposed and no content is stored, so there is nothing to delete.'
+      : 'No content is stored for this document, so there is nothing to delete.';
   }
   const canDeleteContent = !deleteBlock;
 
@@ -488,12 +528,12 @@ export default function DocumentContent({
           <strong>No file stored</strong>
         </p>
         <p style={{ marginTop: 4 }}>
-          This document is registered evidence metadata, but the Document service holds no content
-          file for it yet. Upload the file this record evidences ({MAX_CONTENT_LABEL} maximum). The
-          document metadata stays authoritative.
+          {disposed
+            ? 'This document has been disposed and the Document service holds no content file for it. Disposition destroys any stored content and retains the document metadata and audit trail; no replacement file is offered.'
+            : `This document is registered evidence metadata, but the Document service holds no content file for it yet. Upload the file this record evidences (${MAX_CONTENT_LABEL} maximum). The document metadata stays authoritative.`}
         </p>
 
-        {renderUploader()}
+        {!disposed && renderUploader()}
       </div>
     );
   }
@@ -606,9 +646,9 @@ export default function DocumentContent({
         >
           <h4 style={{ color: 'var(--eia-red)' }}>Content deleted</h4>
           <p>
-            The stored bytes were destroyed and cannot be downloaded or recovered. The tombstone
-            below is retained for audit: the file name, hash, size, and version still identify the
-            evidence that was deleted.
+            {disposed
+              ? 'Disposition destroyed the stored bytes automatically, so they cannot be downloaded or recovered. The tombstone below is retained with the document audit trail: the file name, hash, size, and version still identify the evidence that was destroyed. No separate content deletion is required.'
+              : 'The stored bytes were destroyed and cannot be downloaded or recovered. The tombstone below is retained for audit: the file name, hash, size, and version still identify the evidence that was deleted.'}
           </p>
         </div>
 
@@ -702,7 +742,8 @@ export default function DocumentContent({
         <p className="eia-muted" style={{ margin: '0 0 10px' }}>
           Deleting the content permanently removes the stored bytes so they can no longer be
           downloaded. The document itself is not disposed: its file name, hash, size, and version
-          audit remain as a tombstone. A legal hold blocks deletion.
+          audit remain as a tombstone. Disposing the document destroys the content automatically
+          and needs no separate delete; a legal hold blocks deletion.
         </p>
 
         <div className="eia-actions" style={{ justifyContent: 'flex-start' }}>
@@ -757,7 +798,9 @@ export default function DocumentContent({
         </div>
         <p className="eia-muted" style={{ margin: '0 0 10px' }}>
           {deleted
-            ? 'Revision metadata is retained for audit. The revision bytes were deleted, so no version can be downloaded.'
+            ? `Revision metadata is retained for audit. ${
+                disposed ? 'Disposition destroyed the revision bytes' : 'The revision bytes were deleted'
+              }, so no version can be downloaded.`
             : 'Every upload is retained as an immutable revision. Downloading an older version never changes the current file.'}
         </p>
 
@@ -903,7 +946,9 @@ export default function DocumentContent({
           never changes the business facts the document evidences or the records it is linked to.
           Each upload is retained as a version so an earlier file can be produced without altering
           the record. Deleting the content destroys its bytes permanently while the file name, hash,
-          size, and version audit remain as a tombstone; a legal hold blocks deletion.
+          size, and version audit remain as a tombstone; a legal hold blocks deletion. Disposing the
+          document destroys the stored content automatically and leaves the same tombstone, so no
+          separate content deletion is required.
         </p>
       </section>
 

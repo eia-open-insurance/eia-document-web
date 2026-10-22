@@ -67,6 +67,13 @@ history ordering and columns, version blob download, upload refresh, empty
 history, version/read errors, metadata rendering, current download, empty
 state, and oversized rejection.
 
+Disposition also destroys the stored content. After a successful dispose the
+workbench refreshes the document and `content/metadata` projections, so the
+File tab immediately renders the retained content tombstone (file name, hash,
+size, and version audit) with downloads disabled. A document that never stored
+content stays in the empty state after disposition, with no replacement upload
+offered. No separate content `DELETE` is issued after dispose.
+
 ## Retention, legal hold, and disposition
 
 The **Retention** tab reads the retention and hold facts already carried by the
@@ -78,17 +85,20 @@ date, `statusBeforeHold`, and `disposedAt`) and offers the governed actions:
 - `POST /api/v1/documents/{documentId}/hold/release` releases the active hold;
   the record returns to the status it held before the hold.
 - `POST /api/v1/documents/{documentId}/dispose` disposes the record after a red
-  confirmation. Disposition is irreversible: the stored content is destroyed,
-  while the document tombstone, audit trail, and disposition certificate are
-  retained.
+  confirmation. Disposition is irreversible: the stored content is destroyed
+  automatically and its file name, hash, size, and versions remain as a content
+  tombstone, while the document metadata, audit trail, and disposition
+  certificate are retained. No separate content deletion is required.
 
 A legal hold blocks disposition. The dispose action is enabled only when a
 retention date is set, that date has been reached, no hold is active, and the
 record is not already disposed; otherwise the tab shows the disabled reason
 inline and as the button title. A successful action updates the record in the
 queue and the panel from the API response, falling back to the commanded facts
-when the API answers 204 or a narrow projection. Place, release, dispose, and
-their blocked and error states are covered by `tests/retention.spec.js`.
+when the API answers 204 or a narrow projection, and refreshes the content
+projection so the File tab shows the tombstone immediately. Place, release,
+dispose, automatic content tombstoning, and their blocked, empty-content, and
+error states are covered by `tests/retention.spec.js`.
 
 ## Verification
 
