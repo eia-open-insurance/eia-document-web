@@ -554,7 +554,7 @@ test('keeps the registered document when the optional file upload fails', async 
   });
 
   await page.goto('/');
-  await page.getByRole('button', { name: 'Register document' }).click();
+  await page.getByRole('button', { name: 'Register document' }).first().click();
   const dialog = page.getByRole('dialog', { name: 'Register document' });
   await dialog.getByLabel('Title').fill('Registered without content');
   await dialog.getByLabel('File (optional)').setInputFiles({
